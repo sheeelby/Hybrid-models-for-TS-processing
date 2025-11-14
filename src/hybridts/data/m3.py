@@ -144,12 +144,13 @@ def plot_forecast(title: str, y_tr: np.ndarray, y_te: np.ndarray, forecasts: Dic
 
     H = len(y_te)
     xs_tr = np.arange(len(y_tr))
-    xs_te = np.arange(len(y_tr), len(y_tr) + H)
+    xs_te = np.arange(len(y_tr)-1, len(y_tr) + H)
+    last_tr = np.array([y_tr[-1]])
     plt.figure(figsize=(8, 3.2))
     plt.plot(xs_tr, y_tr, label="train")
-    plt.plot(xs_te, y_te, label="test")
+    plt.plot(xs_te, np.hstack([last_tr, y_te]), label="test")
     for k, v in forecasts.items():
-        plt.plot(xs_te, v, label=k)
+        plt.plot(xs_te, np.hstack([last_tr, v]), label=k)
     plt.title(title)
     plt.xlabel("t")
     plt.legend()
@@ -157,7 +158,7 @@ def plot_forecast(title: str, y_tr: np.ndarray, y_te: np.ndarray, forecasts: Dic
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, bbox_inches="tight", dpi=120)
-    plt.show()
+    # plt.show()
     plt.close()
 
 
