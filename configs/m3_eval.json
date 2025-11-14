@@ -1,0 +1,10 @@
+{
+  "categories": ["yearly", "quarterly", "monthly"],
+  "n_per_cat": 8,
+  "pick": "random",
+  "seed": 42,
+  "epochs": 8,
+  "wavelet": "db4",
+  "level": 1,
+  "force_rebuild_csv": false
+}
