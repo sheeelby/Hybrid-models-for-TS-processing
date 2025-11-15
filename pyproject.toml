@@ -16,7 +16,8 @@ dependencies = [
   "scipy",
   "PyWavelets",
   "matplotlib",
-  "statsmodels"
+  "statsmodels",
+  "tqdm"
 ]
 
 [tool.setuptools.packages.find]
