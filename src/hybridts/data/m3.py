@@ -118,8 +118,18 @@ def load_train_tsts(cat: str, csv_dir: Path | None = None) -> List[Tuple[str, np
 
 
 def best_L(y_tr: np.ndarray, H: int, per: int, Lmin: int = 16, Lcap: int = 192) -> int:
-    L0 = max(2 * H, 3 * per, Lmin)
-    L = int(max(Lmin, min(L0, len(y_tr) - H - 4, Lcap)))
+    """Choose a safe, dynamically-sized lookback for an M3 series.
+
+    The base target length depends on the forecasting horizon and seasonality
+    (via ``per``), but the final lookback is always clipped so that the sliding
+    window dataset has at least one training example for the given series.
+    """
+    # Desired (unclipped) lookback based on horizon and seasonality.
+    base_L = max(2 * H, 3 * per, Lmin)
+    # Maximum feasible lookback for this particular series length.
+    Lmax = max(Lmin, len(y_tr) - H)
+    # Clip into [Lmin, Lmax] and optionally apply an upper cap.
+    L = int(max(Lmin, min(base_L, Lmax, Lcap)))
     return L
 
 
@@ -148,6 +158,19 @@ def mape(y_true: np.ndarray, y_pred: np.ndarray):
     if not np.any(mask):
         return 0.0
     return 100 * np.mean(np.divide(diff[mask], denom[mask], out=np.zeros_like(diff[mask]), where=mask))
+
+
+def mse(y_true: np.ndarray, y_pred: np.ndarray):
+    y_true = np.asarray(y_true, float)
+    y_pred = np.asarray(y_pred, float)
+    if y_true.size == 0:
+        return 0.0
+    diff = y_true - y_pred
+    return float(np.mean(diff ** 2))
+
+
+def rmse(y_true: np.ndarray, y_pred: np.ndarray):
+    return float(np.sqrt(mse(y_true, y_pred)))
 
 
 def r2_score(y_true: np.ndarray, y_pred: np.ndarray):
@@ -196,5 +219,7 @@ __all__ = [
     "seasonal_naive",
     "smape",
     "mape",
+    "mse",
+    "rmse",
     "r2_score",
 ]

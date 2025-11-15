@@ -9,6 +9,8 @@ from .m3 import (
     seasonal_naive,
     smape,
     mape,
+    mse,
+    rmse,
     r2_score,
 )
 
@@ -22,5 +24,7 @@ __all__ = [
     "seasonal_naive",
     "smape",
     "mape",
+    "mse",
+    "rmse",
     "r2_score",
 ]

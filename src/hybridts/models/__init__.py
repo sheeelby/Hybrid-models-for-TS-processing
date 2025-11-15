@@ -1,5 +1,5 @@
 """Base model implementations and factories."""
-from .classic import arima_forecast, ets_forecast
+from .classic import arima_forecast, ets_forecast, auto_arima_forecast, prophet_forecast
 from .factory import make_model
 from .helformer import Helformer, HelformerAutoRegressor
 from .nbeats import NBEATSV2
@@ -13,4 +13,6 @@ __all__ = [
     "TimesNetV2",
     "arima_forecast",
     "ets_forecast",
+    "auto_arima_forecast",
+    "prophet_forecast",
 ]
