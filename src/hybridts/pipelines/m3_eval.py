@@ -19,10 +19,11 @@ from ..data import (
     seasonal_naive,
     smape,
     mape,
-    r2_score,
+    mse,
+    rmse,
 )
 from ..hybrids import HybridPlus
-from ..models import arima_forecast, ets_forecast, make_model
+from ..models import arima_forecast, auto_arima_forecast, ets_forecast, make_model, prophet_forecast
 from ..training import TrainConfig
 
 MODEL_LABELS = {
@@ -68,6 +69,7 @@ def evaluate_m3_hybrids(
     torch.manual_seed(seed)
 
     rows: List[Dict] = []
+    freq_map = {"yearly": "Y", "quarterly": "Q", "monthly": "M"}
     for cat in categories:
         H = M3_H[cat]
         per = M3_P[cat]
@@ -111,14 +113,24 @@ def evaluate_m3_hybrids(
                 except Exception as exc:
                     print(f"[{cat}:{sid}] {label} failed: {exc}")
             # Классические эталонные модели
+            # classical baselines
             try:
                 forecasts["ARIMA"] = arima_forecast(y_tr, H)
             except Exception as exc:
                 print(f"[{cat}:{sid}] ARIMA failed: {exc}")
             try:
+                forecasts["ARIMA_auto"] = auto_arima_forecast(y_tr, H)
+            except Exception as exc:
+                print(f"[{cat}:{sid}] ARIMA_auto failed: {exc}")
+            try:
                 forecasts["ETS"] = ets_forecast(y_tr, H, seasonal_periods=per)
             except Exception as exc:
                 print(f"[{cat}:{sid}] ETS failed: {exc}")
+            try:
+                freq = freq_map.get(cat, "D")
+                forecasts["Prophet"] = prophet_forecast(y_tr, H, freq=freq)
+            except Exception as exc:
+                print(f"[{cat}:{sid}] Prophet failed: {exc}")
             if not forecasts:
                 naive = seasonal_naive(y_tr, H, per)
                 for model_name in base_models:
@@ -129,7 +141,8 @@ def evaluate_m3_hybrids(
                 key = name.replace(" ", "_")
                 rec[f"{key}_sMAPE"] = smape(y_te, pred)
                 rec[f"{key}_MAPE"] = mape(y_te, pred)
-                rec[f"{key}_R2"] = r2_score(y_te, pred)
+                rec[f"{key}_RMSE"] = rmse(y_te, pred)
+                rec[f"{key}_MSE"] = mse(y_te, pred)
             rows.append(rec)
             save_png = out_dir / f"{cat}_{sid}.png"
             title = f"{cat.upper()} {sid} (H={H}, L={L})"
@@ -143,7 +156,8 @@ def evaluate_m3_hybrids(
         metric_suffixes = {
             "sMAPE": "_sMAPE",
             "MAPE": "_MAPE",
-            "R2": "_R2",
+            "RMSE": "_RMSE",
+            "MSE": "_MSE",
         }
         for metric, suffix in metric_suffixes.items():
             cols = [c for c in df.columns if c.endswith(suffix)]
