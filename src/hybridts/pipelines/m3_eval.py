@@ -7,6 +7,10 @@ from typing import Dict, Iterable, List
 import numpy as np
 import pandas as pd
 import torch
+try:  # pragma: no cover - optional dependency
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - best-effort fallback
+    tqdm = None
 
 from ..config.settings import settings
 from ..data import (
@@ -24,6 +28,11 @@ from ..data import (
 from ..hybrids import HybridPlus
 from ..models import arima_forecast, ets_forecast, make_model
 from ..training import TrainConfig
+
+def _progress(iterable, **kwargs):
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, **kwargs)
 
 MODEL_LABELS = {
     "timesnet": "TimesNet+",
@@ -68,25 +77,27 @@ def evaluate_m3_hybrids(
     torch.manual_seed(seed)
 
     rows: List[Dict] = []
-    for cat in categories:
+    categories = tuple(categories)
+    for cat in _progress(categories, desc="Categories"):
         H = M3_H[cat]
         per = M3_P[cat]
         pairs = load_train_tsts(cat, csv_dir=csv_dir)
         if not pairs:
             print(f"[{cat}] no pairs found in CSV dir: {csv_dir}")
             continue
+        selected_list: List[tuple[str, np.ndarray, np.ndarray]]
         if n_per_cat is None or n_per_cat <= 0:
-            selected = pairs
+            selected_list = pairs
         elif pick == "first":
-            selected = pairs[:n_per_cat]
+            selected_list = pairs[:n_per_cat]
         elif pick == "last":
-            selected = pairs[-n_per_cat:]
+            selected_list = pairs[-n_per_cat:]
         else:
             count = min(n_per_cat, len(pairs))
             idx = rng.choice(len(pairs), size=count, replace=False)
-            selected = [pairs[int(i)] for i in idx]
+            selected_list = [pairs[int(i)] for i in idx]
 
-        for sid, y_tr, y_te in selected:
+        for sid, y_tr, y_te in _progress(selected_list, desc=f"{cat} series", leave=False):
             L = best_L(y_tr, H, per)
             cfg = TrainConfig(
                 lookback=L,
