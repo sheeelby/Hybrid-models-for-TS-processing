@@ -4,6 +4,6 @@ __pycache__/
 .vscode/
 .DS_Store
 .env
-.venv
+.venv/
 src/outputs
 src/hybridts.egg-info
