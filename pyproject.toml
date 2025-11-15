@@ -15,7 +15,8 @@ dependencies = [
   "torch",
   "scipy",
   "PyWavelets",
-  "matplotlib"
+  "matplotlib",
+  "statsmodels"
 ]
 
 [tool.setuptools.packages.find]

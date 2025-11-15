@@ -3,7 +3,8 @@
   "n_per_cat": 8,
   "pick": "random",
   "seed": 42,
-  "epochs": 8,
+  "epochs": 10,
+  "base_models": ["timesnet", "nbeats", "helformer"],
   "wavelet": "db4",
   "level": 1,
   "force_rebuild_csv": false

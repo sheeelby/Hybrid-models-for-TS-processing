@@ -37,9 +37,15 @@ class Settings:
     def from_env(cls) -> "Settings":
         env = {**_read_env_file(_ENV_PATH), **os.environ}
         root = Path(env.get("PROJECT_ROOT", _PROJECT_ROOT)).resolve()
-        data_dir = Path(env.get("DATA_DIR", root / "data")).resolve()
-        m3_csv_dir = Path(env.get("M3_CSV_DIR", data_dir / "m3" / "csv")).resolve()
-        m3_tsf_dir = Path(env.get("M3_TSF_DIR", data_dir / "m3" / "tsf")).resolve()
+        data_dir = Path(env.get("DATA_DIR", root / "data")).expanduser().resolve()
+        if not data_dir.exists():
+            alt = (root / "src" / "data").resolve()
+            if alt.exists():
+                data_dir = alt
+            else:
+                data_dir.mkdir(parents=True, exist_ok=True)
+        m3_csv_dir = Path(env.get("M3_CSV_DIR", data_dir / "m3" / "csv")).expanduser().resolve()
+        m3_tsf_dir = Path(env.get("M3_TSF_DIR", data_dir / "m3" / "tsf")).expanduser().resolve()
         outputs_dir = Path(env.get("OUTPUTS_DIR", root / "outputs")).resolve()
         outputs_dir.mkdir(parents=True, exist_ok=True)
         return cls(

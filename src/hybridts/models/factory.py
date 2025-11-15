@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch.nn as nn
 
+from .helformer import HelformerAutoRegressor
 from .nbeats import NBEATSV2
 from .timesnet import TimesNetV2
 from ..training.engine import TrainConfig
@@ -14,6 +15,8 @@ def make_model(name: str, cfg: TrainConfig) -> nn.Module:
         return TimesNetV2(cfg.lookback, cfg.horizon, d_model=32, layers=2, topk=2)
     if name == "nbeats":
         return NBEATSV2(cfg.lookback, cfg.horizon, width=128, depth=2, nblocks=2)
+    if name == "helformer":
+        return HelformerAutoRegressor(horizon=cfg.horizon, input_dim=1)
     raise ValueError(f"Unknown model '{name}'")
 
 

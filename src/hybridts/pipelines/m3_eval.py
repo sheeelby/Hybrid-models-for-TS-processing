@@ -18,10 +18,18 @@ from ..data import (
     plot_forecast,
     seasonal_naive,
     smape,
+    mape,
+    r2_score,
 )
 from ..hybrids import HybridPlus
-from ..models import make_model
+from ..models import arima_forecast, ets_forecast, make_model
 from ..training import TrainConfig
+
+MODEL_LABELS = {
+    "timesnet": "TimesNet+",
+    "nbeats": "N-BEATS Full",
+    "helformer": "Helformer+",
+}
 
 
 def _base_factory(name: str):
@@ -33,10 +41,11 @@ def _base_factory(name: str):
 
 def evaluate_m3_hybrids(
     categories: Iterable[str] = ("yearly", "quarterly", "monthly"),
-    n_per_cat: int = 8,
+    n_per_cat: int | None = None,
     pick: str = "random",
     seed: int = 42,
     epochs: int = 8,
+    base_models: Iterable[str] | None = None,
     csv_dir: Path | None = None,
     tsf_dir: Path | None = None,
     out_prefix: Path | None = None,
@@ -44,10 +53,13 @@ def evaluate_m3_hybrids(
     level: int = 1,
     force_rebuild_csv: bool = False,
 ) -> pd.DataFrame:
+    base_models = tuple((m.lower() for m in (base_models or ("timesnet", "nbeats", "helformer"))))
+    label_map = {name: MODEL_LABELS.get(name, f"{name.title()}+") for name in base_models}
+
     csv_dir = Path(csv_dir or settings.m3_csv_dir)
     tsf_dir = Path(tsf_dir or settings.m3_tsf_dir)
     out_dir = Path(out_prefix or (settings.outputs_dir / "m3_eval"))
-    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     ensure_m3_csv(csv_dir=csv_dir, tsf_dir=tsf_dir, force_rebuild=force_rebuild_csv)
 
@@ -56,7 +68,6 @@ def evaluate_m3_hybrids(
     torch.manual_seed(seed)
 
     rows: List[Dict] = []
-    out_prefix = str(out_dir)
     for cat in categories:
         H = M3_H[cat]
         per = M3_P[cat]
@@ -64,7 +75,9 @@ def evaluate_m3_hybrids(
         if not pairs:
             print(f"[{cat}] no pairs found in CSV dir: {csv_dir}")
             continue
-        if pick == "first":
+        if n_per_cat is None or n_per_cat <= 0:
+            selected = pairs
+        elif pick == "first":
             selected = pairs[:n_per_cat]
         elif pick == "last":
             selected = pairs[-n_per_cat:]
@@ -80,49 +93,67 @@ def evaluate_m3_hybrids(
                 horizon=H,
                 epochs=epochs,
                 batch_size=64,
-                lr=3e-3,
+                lr=5e-4,
                 weight_decay=1e-4,
                 clip=1.0,
             )
             forecasts: Dict[str, np.ndarray] = {}
+            for model_name in base_models:
+                label = label_map[model_name]
+                try:
+                    model = HybridPlus(
+                        base_model_fn=_base_factory(model_name),
+                        cfg=cfg,
+                        wavelet=wavelet,
+                        level=level,
+                    ).fit(y_tr)
+                    forecasts[label] = model.forecast(y_tr)
+                except Exception as exc:
+                    print(f"[{cat}:{sid}] {label} failed: {exc}")
+            # Классические эталонные модели
             try:
-                m_tn = HybridPlus(
-                    base_model_fn=_base_factory("timesnet"),
-                    cfg=cfg,
-                    wavelet=wavelet,
-                    level=level,
-                ).fit(y_tr)
-                forecasts["TimesNet+"] = m_tn.forecast(y_tr)
+                forecasts["ARIMA"] = arima_forecast(y_tr, H)
             except Exception as exc:
-                print(f"[{cat}:{sid}] TimesNet+ failed: {exc}")
+                print(f"[{cat}:{sid}] ARIMA failed: {exc}")
             try:
-                m_nb = HybridPlus(
-                    base_model_fn=_base_factory("nbeats"),
-                    cfg=cfg,
-                    wavelet=wavelet,
-                    level=level,
-                ).fit(y_tr)
-                forecasts["N-BEATS Full"] = m_nb.forecast(y_tr)
+                forecasts["ETS"] = ets_forecast(y_tr, H, seasonal_periods=per)
             except Exception as exc:
-                print(f"[{cat}:{sid}] N-BEATS failed: {exc}")
+                print(f"[{cat}:{sid}] ETS failed: {exc}")
             if not forecasts:
                 naive = seasonal_naive(y_tr, H, per)
-                forecasts["TimesNet+"] = naive
-                forecasts["N-BEATS Full"] = naive.copy()
+                for model_name in base_models:
+                    label = label_map[model_name]
+                    forecasts[label] = naive.copy()
             rec = {"category": cat, "series_id": sid}
             for name, pred in forecasts.items():
-                rec[f"{name.replace(' ', '_')}_sMAPE"] = smape(y_te, pred)
+                key = name.replace(" ", "_")
+                rec[f"{key}_sMAPE"] = smape(y_te, pred)
+                rec[f"{key}_MAPE"] = mape(y_te, pred)
+                rec[f"{key}_R2"] = r2_score(y_te, pred)
             rows.append(rec)
-            save_png = f"{out_prefix}_{cat}_{sid}.png"
-            plot_forecast(f"{cat.upper()} {sid} (H={H}, L={L})", y_tr, y_te, forecasts, save_path=save_png)
+            save_png = out_dir / f"{cat}_{sid}.png"
+            title = f"{cat.upper()} {sid} (H={H}, L={L})"
+            plot_forecast(title, y_tr, y_te, forecasts, save_path=save_png)
 
     df = pd.DataFrame(rows)
-    metrics_csv = f"{out_prefix}_metrics.csv"
+    metrics_csv = out_dir / "metrics.csv"
     df.to_csv(metrics_csv, index=False)
     print(f"[saved] metrics: {metrics_csv}")
-    smape_cols = [c for c in df.columns if c.endswith("_sMAPE")]
-    if not df.empty and smape_cols:
-        print(df.groupby("category")[smape_cols].mean(numeric_only=True).round(3))
+    if not df.empty:
+        metric_suffixes = {
+            "sMAPE": "_sMAPE",
+            "MAPE": "_MAPE",
+            "R2": "_R2",
+        }
+        for metric, suffix in metric_suffixes.items():
+            cols = [c for c in df.columns if c.endswith(suffix)]
+            if not cols:
+                continue
+            print(f"[{metric}] mean by category")
+            print(df.groupby("category")[cols].mean(numeric_only=True).round(3))
+            overall = df[cols].mean(numeric_only=True)
+            print(f"[{metric} overall]")
+            print(overall.round(3))
     else:
         print("No results generated — check CSV/logs.")
     return df

@@ -139,6 +139,30 @@ def smape(y_true: np.ndarray, y_pred: np.ndarray):
     return 200 * np.mean(np.divide(diff[mask], denom[mask], out=np.zeros_like(diff[mask]), where=mask))
 
 
+def mape(y_true: np.ndarray, y_pred: np.ndarray):
+    y_true = np.asarray(y_true, float)
+    y_pred = np.asarray(y_pred, float)
+    denom = np.abs(y_true)
+    diff = np.abs(y_true - y_pred)
+    mask = denom > 0
+    if not np.any(mask):
+        return 0.0
+    return 100 * np.mean(np.divide(diff[mask], denom[mask], out=np.zeros_like(diff[mask]), where=mask))
+
+
+def r2_score(y_true: np.ndarray, y_pred: np.ndarray):
+    y_true = np.asarray(y_true, float)
+    y_pred = np.asarray(y_pred, float)
+    if y_true.size == 0:
+        return 0.0
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    mean_true = np.mean(y_true)
+    ss_tot = np.sum((y_true - mean_true) ** 2)
+    if ss_tot <= 1e-12:
+        return 0.0
+    return 1 - ss_res / ss_tot
+
+
 def plot_forecast(title: str, y_tr: np.ndarray, y_te: np.ndarray, forecasts: Dict[str, np.ndarray], save_path: Path | None = None):
     import matplotlib.pyplot as plt
 
@@ -171,4 +195,6 @@ __all__ = [
     "plot_forecast",
     "seasonal_naive",
     "smape",
+    "mape",
+    "r2_score",
 ]

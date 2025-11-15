@@ -8,6 +8,8 @@ from .m3 import (
     plot_forecast,
     seasonal_naive,
     smape,
+    mape,
+    r2_score,
 )
 
 __all__ = [
@@ -19,4 +21,6 @@ __all__ = [
     "plot_forecast",
     "seasonal_naive",
     "smape",
+    "mape",
+    "r2_score",
 ]

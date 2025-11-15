@@ -43,7 +43,10 @@ def train_model(model: torch.nn.Module, dataset: Dataset, cfg: TrainConfig):
             yb = yb.to(device).float()
 
             optimizer.zero_grad()
-            preds = model(xb)
+            if hasattr(model, "forward_with_target"):
+                preds = model.forward_with_target(xb, yb)
+            else:
+                preds = model(xb)
             loss = loss_fn(preds, yb)
             loss.backward()
 
