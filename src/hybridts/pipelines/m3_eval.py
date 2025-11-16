@@ -79,6 +79,7 @@ def evaluate_m3_hybrids(
 
     rows: List[Dict] = []
     categories = tuple(categories)
+    freq_map = {"yearly": "Y", "quarterly": "Q", "monthly": "ME"}
     for cat in _progress(categories, desc="Categories"):
         H = M3_H[cat]
         per = M3_P[cat]

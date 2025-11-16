@@ -1,6 +1,6 @@
 {
   "categories": ["yearly", "quarterly", "monthly"],
-  "n_per_cat": 100,
+  "n_per_cat": 50,
   "pick": "random",
   "seed": 123,
   "epochs": 12,
