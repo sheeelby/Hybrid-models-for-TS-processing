@@ -1,0 +1,19 @@
+{
+  "profiles": [
+    "flat_low_noise",
+    "trend_only",
+    "season_only",
+    "trend_season",
+    "trend_season_high_noise",
+    "season_high_noise"
+  ],
+  "n_per_profile": 2,
+  "length": 400,
+  "horizon": 24,
+  "epochs": 8,
+  "base_models": ["timesnet", "nbeats", "helformer"],
+  "seed": 42,
+  "wavelet": "db4",
+  "level": 1
+}
+

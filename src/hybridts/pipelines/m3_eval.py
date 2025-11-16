@@ -27,8 +27,15 @@ from ..data import (
     rmse,
 )
 from ..hybrids import HybridPlus
-from ..models import arima_forecast, auto_arima_forecast, ets_forecast, make_model, prophet_forecast
-from ..training import TrainConfig
+from ..models import (
+    HelformerAutoRegressor,
+    arima_forecast,
+    auto_arima_forecast,
+    ets_forecast,
+    make_model,
+    prophet_forecast,
+)
+from ..training import TrainConfig, WindowDatasetStd, train_model
 
 def _progress(iterable, **kwargs):
     if tqdm is None:
@@ -38,7 +45,7 @@ def _progress(iterable, **kwargs):
 MODEL_LABELS = {
     "timesnet": "TimesNet+",
     "nbeats": "N-BEATS Full",
-    "helformer": "Helformer+",
+    "helformer": "Helformer",
 }
 
 
@@ -65,6 +72,8 @@ def evaluate_m3_hybrids(
 ) -> pd.DataFrame:
     base_models = tuple((m.lower() for m in (base_models or ("timesnet", "nbeats", "helformer"))))
     label_map = {name: MODEL_LABELS.get(name, f"{name.title()}+") for name in base_models}
+    use_helformer = "helformer" in base_models
+    hybrid_models = tuple(m for m in base_models if m != "helformer")
 
     csv_dir = Path(csv_dir or settings.m3_csv_dir)
     tsf_dir = Path(tsf_dir or settings.m3_tsf_dir)
@@ -111,7 +120,7 @@ def evaluate_m3_hybrids(
                 clip=1.0,
             )
             forecasts: Dict[str, np.ndarray] = {}
-            for model_name in base_models:
+            for model_name in hybrid_models:
                 label = label_map[model_name]
                 try:
                     model = HybridPlus(
@@ -137,6 +146,29 @@ def evaluate_m3_hybrids(
                 forecasts["ETS"] = ets_forecast(y_tr, H, seasonal_periods=per)
             except Exception as exc:
                 print(f"[{cat}:{sid}] ETS failed: {exc}")
+            if use_helformer:
+                try:
+                    ds_h = WindowDatasetStd(y_tr, L, H, stride=1, scale=False)
+                    if len(ds_h) > 0:
+                        cfg_h = TrainConfig(
+                            lookback=L,
+                            horizon=H,
+                            epochs=epochs,
+                            batch_size=64,
+                            lr=5e-4,
+                            weight_decay=1e-4,
+                            clip=1.0,
+                        )
+                        model_h = HelformerAutoRegressor(horizon=H, input_dim=1)
+                        model_h = train_model(model_h, ds_h, cfg_h)
+                        if model_h is not None:
+                            xb = torch.from_numpy(y_tr[-L:].astype(np.float32)).view(1, -1, 1)
+                            xb = xb.to(cfg_h.device)
+                            with torch.no_grad():
+                                pred_h = model_h(xb).cpu().numpy().ravel()
+                            forecasts[label_map["helformer"]] = pred_h
+                except Exception as exc:
+                    print(f"[{cat}:{sid}] Helformer failed: {exc}")
             try:
                 freq = freq_map.get(cat, "D")
                 forecasts["Prophet"] = prophet_forecast(y_tr, H, freq=freq)
