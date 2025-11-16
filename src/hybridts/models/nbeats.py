@@ -6,12 +6,25 @@ import torch.nn as nn
 
 
 class NBEATBlock(nn.Module):
-    def __init__(self, lookback: int, horizon: int, width: int = 128, depth: int = 2):
+    def __init__(
+        self,
+        lookback: int,
+        horizon: int,
+        width: int = 128,
+        depth: int = 2,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         layers = []
         in_features = lookback
         for _ in range(depth):
-            layers.extend([nn.Linear(in_features, width), nn.ReLU()])
+            layers.extend(
+                [
+                    nn.Linear(in_features, width),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                ]
+            )
             in_features = width
         self.fc = nn.Sequential(*layers)
         self.theta_b = nn.Linear(width, lookback)
@@ -23,12 +36,22 @@ class NBEATBlock(nn.Module):
 
 
 class NBEATSV2(nn.Module):
-    def __init__(self, lookback: int, horizon: int, width: int = 128, depth: int = 2, nblocks: int = 2):
+    def __init__(
+        self,
+        lookback: int,
+        horizon: int,
+        width: int = 128,
+        depth: int = 2,
+        nblocks: int = 2,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.blocks = nn.ModuleList([
-            NBEATBlock(lookback, horizon, width=width, depth=depth)
-            for _ in range(nblocks)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                NBEATBlock(lookback, horizon, width=width, depth=depth, dropout=dropout)
+                for _ in range(nblocks)
+            ]
+        )
         self.horizon = horizon
 
     def forward(self, x: torch.Tensor):

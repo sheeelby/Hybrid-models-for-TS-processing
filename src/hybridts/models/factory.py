@@ -12,11 +12,21 @@ from ..training.engine import TrainConfig
 def make_model(name: str, cfg: TrainConfig) -> nn.Module:
     name = name.lower()
     if name == "timesnet":
-        return TimesNetV2(cfg.lookback, cfg.horizon, d_model=32, layers=2, topk=2)
+        # Slightly regularised TimesNet variant for small datasets
+        return TimesNetV2(cfg.lookback, cfg.horizon, d_model=32, layers=2, topk=2, dropout=0.1)
     if name == "nbeats":
-        return NBEATSV2(cfg.lookback, cfg.horizon, width=128, depth=2, nblocks=2)
+        # Narrower N-BEATS with dropout to reduce overfitting on short series
+        return NBEATSV2(cfg.lookback, cfg.horizon, width=64, depth=2, nblocks=2, dropout=0.1)
     if name == "helformer":
-        return HelformerAutoRegressor(horizon=cfg.horizon, input_dim=1)
+        # Compact Helformer configuration tuned for limited data
+        return HelformerAutoRegressor(
+            horizon=cfg.horizon,
+            input_dim=1,
+            num_heads=2,
+            head_dim=16,
+            lstm_units=16,
+            dropout=0.1,
+        )
     raise ValueError(f"Unknown model '{name}'")
 
 

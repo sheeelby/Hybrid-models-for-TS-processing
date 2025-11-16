@@ -8,12 +8,22 @@ from .timesnet_blocks import MSUnit
 
 
 class TimesBlockV2(nn.Module):
-    def __init__(self, lookback: int, horizon: int, d_model: int = 32, topk: int = 2):
+    def __init__(
+        self,
+        lookback: int,
+        horizon: int,
+        d_model: int = 32,
+        topk: int = 2,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.horizon = horizon
         self.topk = topk
-        self.msunit = MSUnit(1, d_model)
-        self.head = nn.Linear(lookback, horizon)
+        self.msunit = MSUnit(1, d_model, dropout=dropout)
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(lookback, horizon),
+        )
 
     def _reshape_2d(self, x: torch.Tensor, period: int):
         batch, _, length = x.shape
@@ -63,12 +73,22 @@ class TimesBlockV2(nn.Module):
 
 
 class TimesNetV2(nn.Module):
-    def __init__(self, lookback: int, horizon: int, d_model: int = 32, layers: int = 2, topk: int = 2):
+    def __init__(
+        self,
+        lookback: int,
+        horizon: int,
+        d_model: int = 32,
+        layers: int = 2,
+        topk: int = 2,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.blocks = nn.ModuleList([
-            TimesBlockV2(lookback, horizon, d_model=d_model, topk=topk)
-            for _ in range(layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                TimesBlockV2(lookback, horizon, d_model=d_model, topk=topk, dropout=dropout)
+                for _ in range(layers)
+            ]
+        )
         self.horizon = horizon
 
     def forward(self, x: torch.Tensor):
