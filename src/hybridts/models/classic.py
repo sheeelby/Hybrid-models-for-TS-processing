@@ -1,6 +1,7 @@
 """Классические статистические модели (ARIMA, ETS) для M3."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Iterable, Tuple
 
 import numpy as np
@@ -22,9 +23,15 @@ except Exception:  # pragma: no cover
 try:  # pragma: no cover - Prophet �?�+�?�����'��>��?
     import pandas as pd
     from prophet import Prophet
+
+    try:
+        from cmdstanpy.utils import disable_logging as _disable_cmdstanpy_logging
+    except Exception:  # pragma: no cover - cmdstanpy optional in some envs
+        _disable_cmdstanpy_logging = None
 except Exception:  # pragma: no cover
     pd = None  # type: ignore[assignment]
     Prophet = None  # type: ignore[assignment]
+    _disable_cmdstanpy_logging = None  # type: ignore[assignment]
 
 def _repeat_last(y: np.ndarray, horizon: int) -> np.ndarray:
     if horizon <= 0:
@@ -155,6 +162,11 @@ def prophet_forecast(
     data = np.asarray(list(y), dtype=float)
     if data.size < 2:
         return _repeat_last(data, horizon)
+    context = (
+        _disable_cmdstanpy_logging()
+        if _disable_cmdstanpy_logging is not None
+        else nullcontext()
+    )
     try:
         start = pd.Timestamp("2000-01-01")
         idx = pd.date_range(start=start, periods=data.size, freq=freq)
@@ -165,9 +177,10 @@ def prophet_forecast(
             weekly_seasonality=False,
             daily_seasonality=False,
         )
-        m.fit(df)
-        future = m.make_future_dataframe(periods=horizon, freq=freq, include_history=False)
-        forecast = m.predict(future)["yhat"].to_numpy()
+        with context:
+            m.fit(df)
+            future = m.make_future_dataframe(periods=horizon, freq=freq, include_history=False)
+            forecast = m.predict(future)["yhat"].to_numpy()
         return np.asarray(forecast, dtype=float)
     except Exception:
         return _repeat_last(data, horizon)

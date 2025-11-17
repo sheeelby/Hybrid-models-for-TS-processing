@@ -150,6 +150,7 @@ def evaluate_synth_hybrids(
     rows: List[Dict] = []
 
     for profile in use_profiles:
+        helformer_state = None
         per = profile.season_period or 1
         for idx in range(n_per_profile):
             series_id = f"{profile.name}_{idx+1}"
@@ -210,25 +211,48 @@ def evaluate_synth_hybrids(
             # Helformer baseline (no MODWT), trained directly on the original series
             if "helformer" in base_models:
                 try:
-                    ds_h = WindowDatasetStd(y_tr, L, horizon, stride=1, scale=False)
+                    ds_h = WindowDatasetStd(y_tr, L, horizon, stride=1, scale=True)
                     if len(ds_h) > 0:
+                        n_samples = len(ds_h)
+                        batch = 8 if n_samples < 8 else 16 if n_samples < 32 else 32 if n_samples < 128 else 64
+                        extra_epochs = 96 if n_samples < 8 else 64 if n_samples < 32 else 40 if n_samples < 128 else 32
+                        if n_samples < 8:
+                            lr_h = 3e-3
+                        elif n_samples < 32:
+                            lr_h = 2e-3
+                        else:
+                            lr_h = 1e-3
                         cfg_h = TrainConfig(
                             lookback=L,
                             horizon=horizon,
-                            epochs=epochs,
-                            batch_size=64,
-                            lr=5e-4,
-                            weight_decay=1e-4,
-                            clip=1.0,
+                            epochs=max(epochs, extra_epochs),
+                            batch_size=batch,
+                            lr=lr_h,
+                            weight_decay=1e-5,
+                            clip=0.5,
                         )
-                        model_h = HelformerAutoRegressor(horizon=horizon, input_dim=1)
+                        model_h = HelformerAutoRegressor(
+                            horizon=horizon,
+                            input_dim=1,
+                            num_heads=2,
+                            head_dim=32,
+                            lstm_units=96,
+                            dropout=0.15,
+                            use_decomposition=False,
+                        )
+                        if helformer_state is not None:
+                            model_h.load_state_dict(helformer_state)
                         model_h = train_model(model_h, ds_h, cfg_h)
                         if model_h is not None:
-                            xb = torch.from_numpy(y_tr[-L:].astype(np.float32)).view(1, -1, 1)
+                            mu, sd = ds_h.scaler
+                            xb_raw = (y_tr[-L:] - mu) / (sd if sd != 0 else 1.0)
+                            xb = torch.from_numpy(xb_raw.astype(np.float32)).view(1, -1, 1)
                             xb = xb.to(cfg_h.device)
                             with torch.no_grad():
                                 pred_h = model_h(xb).cpu().numpy().ravel()
+                            pred_h = pred_h * (sd if sd != 0 else 1.0) + mu
                             forecasts["Helformer"] = pred_h
+                            helformer_state = {k: v.detach().cpu() for k, v in model_h.state_dict().items()}
                 except Exception as exc:
                     print(f"[{profile.name}:{series_id}] Helformer failed: {exc}")
 

@@ -4,6 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+try:  # pragma: no cover - optional dependency
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - fallback
+    tqdm = None
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -36,8 +41,12 @@ def train_model(model: torch.nn.Module, dataset: Dataset, cfg: TrainConfig):
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     loss_fn = nn.MSELoss()
 
+    epoch_iter = range(cfg.epochs)
+    if tqdm is not None:
+        epoch_iter = tqdm(epoch_iter, desc="Helformer train", leave=False)
+
     model.train()
-    for _ in range(cfg.epochs):
+    for _ in epoch_iter:
         for xb, yb in loader:
             xb = xb.to(device).float()
             yb = yb.to(device).float()

@@ -120,17 +120,25 @@ def load_train_tsts(cat: str, csv_dir: Path | None = None) -> List[Tuple[str, np
 def best_L(y_tr: np.ndarray, H: int, per: int, Lmin: int = 16, Lcap: int = 192) -> int:
     """Choose a safe, dynamically-sized lookback for an M3 series.
 
-    The base target length depends on the forecasting horizon and seasonality
-    (via ``per``), but the final lookback is always clipped so that the sliding
-    window dataset has at least one training example for the given series.
+    The desired lookback scales with the horizon and seasonal period, but it is
+    always capped so that at least one sliding window can be extracted from the
+    available training data.  When a series is very short (e.g. yearly M3
+    segments) the function gracefully falls back to the longest feasible window.
     """
+    n = len(y_tr)
+    if n <= H + 1:
+        return 1
     # Desired (unclipped) lookback based on horizon and seasonality.
     base_L = max(2 * H, 3 * per, Lmin)
-    # Maximum feasible lookback for this particular series length.
-    Lmax = max(Lmin, len(y_tr) - H)
-    # Clip into [Lmin, Lmax] and optionally apply an upper cap.
-    L = int(max(Lmin, min(base_L, Lmax, Lcap)))
-    return L
+    base_L = min(base_L, Lcap)
+    # Maximum feasible lookback for at least one window.
+    Lmax = max(1, n - H)
+    min_windows = 8
+    max_for_windows = n - H - (min_windows - 1)
+    if max_for_windows >= 1:
+        Lmax = min(Lmax, max_for_windows)
+    L = int(min(base_L, Lmax))
+    return max(1, L)
 
 
 def seasonal_naive(y_tr: np.ndarray, H: int, per: int):
@@ -146,7 +154,9 @@ def smape(y_true: np.ndarray, y_pred: np.ndarray):
     denom = np.abs(y_true) + np.abs(y_pred)
     diff = np.abs(y_true - y_pred)
     mask = denom > 0
-    return 200 * np.mean(np.divide(diff[mask], denom[mask], out=np.zeros_like(diff[mask]), where=mask))
+    if not np.any(mask):
+        return 0.0
+    return 200 * np.mean(diff[mask] / denom[mask])
 
 
 def mape(y_true: np.ndarray, y_pred: np.ndarray):

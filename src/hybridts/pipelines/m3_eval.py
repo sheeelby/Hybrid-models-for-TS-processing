@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import TensorDataset
 try:  # pragma: no cover - optional dependency
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - best-effort fallback
@@ -56,6 +57,30 @@ def _base_factory(name: str):
     return _fn
 
 
+def _build_global_helformer_dataset(
+    pairs: Sequence[Tuple[str, np.ndarray, np.ndarray]], horizon: int, per: int
+) -> Tuple[TensorDataset | None, int]:
+    lengths: List[int] = []
+    for _, y_tr, _ in pairs:
+        lengths.append(best_L(y_tr, horizon, per))
+    if not lengths:
+        return None, 0
+    lookback = max(8, min(lengths))
+    xs: List[torch.Tensor] = []
+    ys: List[torch.Tensor] = []
+    for _, y_tr, _ in pairs:
+        ds = WindowDatasetStd(y_tr, lookback, horizon, stride=1, scale=False)
+        for idx in range(len(ds)):
+            xb, yb = ds[idx]
+            xs.append(xb)
+            ys.append(yb)
+    if not xs:
+        return None, lookback
+    X = torch.stack(xs)
+    Y = torch.stack(ys)
+    return TensorDataset(X, Y), lookback
+
+
 def evaluate_m3_hybrids(
     categories: Iterable[str] = ("yearly", "quarterly", "monthly"),
     n_per_cat: int | None = None,
@@ -69,6 +94,7 @@ def evaluate_m3_hybrids(
     wavelet: str = "db4",
     level: int = 1,
     force_rebuild_csv: bool = False,
+    series_override: Mapping[str, Sequence[str]] | None = None,
 ) -> pd.DataFrame:
     base_models = tuple((m.lower() for m in (base_models or ("timesnet", "nbeats", "helformer"))))
     label_map = {name: MODEL_LABELS.get(name, f"{name.title()}+") for name in base_models}
@@ -88,7 +114,7 @@ def evaluate_m3_hybrids(
 
     rows: List[Dict] = []
     categories = tuple(categories)
-    freq_map = {"yearly": "Y", "quarterly": "Q", "monthly": "ME"}
+    freq_map = {"yearly": "YE", "quarterly": "QE", "monthly": "ME"}
     for cat in _progress(categories, desc="Categories"):
         H = M3_H[cat]
         per = M3_P[cat]
@@ -97,7 +123,12 @@ def evaluate_m3_hybrids(
             print(f"[{cat}] no pairs found in CSV dir: {csv_dir}")
             continue
         selected_list: List[tuple[str, np.ndarray, np.ndarray]]
-        if n_per_cat is None or n_per_cat <= 0:
+        if series_override and cat in series_override:
+            wanted = set(series_override[cat])
+            selected_list = [triple for triple in pairs if triple[0] in wanted]
+            if n_per_cat and n_per_cat > 0:
+                selected_list = selected_list[: min(len(selected_list), n_per_cat)]
+        elif n_per_cat is None or n_per_cat <= 0:
             selected_list = pairs
         elif pick == "first":
             selected_list = pairs[:n_per_cat]
@@ -107,6 +138,62 @@ def evaluate_m3_hybrids(
             count = min(n_per_cat, len(pairs))
             idx = rng.choice(len(pairs), size=count, replace=False)
             selected_list = [pairs[int(i)] for i in idx]
+
+        global_h_ds: TensorDataset | None = None
+        global_model: HelformerAutoRegressor | None = None
+        global_cfg: TrainConfig | None = None
+        dataset_path = out_dir / f"{cat}_helformer_dataset.pt"
+        model_path = out_dir / f"{cat}_helformer_model.pt"
+        if use_helformer:
+            global_h_ds, global_lookback = _build_global_helformer_dataset(pairs, H, per)
+            if global_h_ds is not None and global_lookback > 0:
+                global_cfg = TrainConfig(
+                    lookback=global_lookback,
+                    horizon=H,
+                    epochs=max(epochs, 80),
+                    batch_size=128,
+                    lr=1e-3,
+                    weight_decay=1e-4,
+                    clip=1.0,
+                )
+                global_model = HelformerAutoRegressor(
+                    horizon=H,
+                    input_dim=1,
+                    num_heads=4,
+                    head_dim=32,
+                    lstm_units=32,
+                    dropout=0.05,
+                    teacher_forcing=0.5,
+                )
+                # Save dataset to disk for reproducibility
+                try:
+                    X, Y = global_h_ds.tensors
+                    torch.save(
+                        {
+                            "category": cat,
+                            "lookback": global_lookback,
+                            "horizon": H,
+                            "X": X.cpu(),
+                            "Y": Y.cpu(),
+                        },
+                        dataset_path,
+                    )
+                except Exception as exc:
+                    print(f"[{cat}] failed to save Helformer dataset: {exc}")
+                global_model = train_model(global_model, global_h_ds, global_cfg)
+                if global_model is not None:
+                    try:
+                        torch.save(
+                            {
+                                "category": cat,
+                                "state_dict": global_model.state_dict(),
+                                "lookback": global_cfg.lookback,
+                                "horizon": global_cfg.horizon,
+                            },
+                            model_path,
+                        )
+                    except Exception as exc:
+                        print(f"[{cat}] failed to save Helformer model: {exc}")
 
         for sid, y_tr, y_te in _progress(selected_list, desc=f"{cat} series", leave=False):
             L = best_L(y_tr, H, per)
@@ -146,27 +233,18 @@ def evaluate_m3_hybrids(
                 forecasts["ETS"] = ets_forecast(y_tr, H, seasonal_periods=per)
             except Exception as exc:
                 print(f"[{cat}:{sid}] ETS failed: {exc}")
-            if use_helformer:
+            if use_helformer and global_model is not None and global_cfg is not None:
                 try:
-                    ds_h = WindowDatasetStd(y_tr, L, H, stride=1, scale=False)
-                    if len(ds_h) > 0:
-                        cfg_h = TrainConfig(
-                            lookback=L,
-                            horizon=H,
-                            epochs=epochs,
-                            batch_size=64,
-                            lr=5e-4,
-                            weight_decay=1e-4,
-                            clip=1.0,
-                        )
-                        model_h = HelformerAutoRegressor(horizon=H, input_dim=1)
-                        model_h = train_model(model_h, ds_h, cfg_h)
-                        if model_h is not None:
-                            xb = torch.from_numpy(y_tr[-L:].astype(np.float32)).view(1, -1, 1)
-                            xb = xb.to(cfg_h.device)
-                            with torch.no_grad():
-                                pred_h = model_h(xb).cpu().numpy().ravel()
-                            forecasts[label_map["helformer"]] = pred_h
+                    seq = y_tr.astype(np.float32)
+                    if seq.size < global_cfg.lookback:
+                        pad = np.full(global_cfg.lookback - seq.size, seq[0], dtype=np.float32)
+                        window = np.concatenate([pad, seq])
+                    else:
+                        window = seq[-global_cfg.lookback :]
+                    xb = torch.from_numpy(window).view(1, -1, 1).to(global_cfg.device)
+                    with torch.no_grad():
+                        pred_h = global_model(xb).cpu().numpy().ravel()
+                    forecasts[label_map["helformer"]] = pred_h
                 except Exception as exc:
                     print(f"[{cat}:{sid}] Helformer failed: {exc}")
             try:

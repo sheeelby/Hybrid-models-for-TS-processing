@@ -1,11 +1,16 @@
 {
   "categories": ["yearly", "quarterly", "monthly"],
-  "n_per_cat": 50,
-  "pick": "random",
+  "n_per_cat": 5,
+  "pick": "first",
   "seed": 123,
-  "epochs": 12,
+  "epochs": 80,
   "base_models": ["helformer"],
   "wavelet": "db4",
   "level": 1,
-  "force_rebuild_csv": false
+  "force_rebuild_csv": false,
+  "series_override": {
+    "yearly": ["T1", "T2", "T3", "T4", "T5"],
+    "quarterly": ["T1", "T2", "T3", "T4", "T5"],
+    "monthly": ["T1", "T2", "T3", "T4", "T5"]
+  }
 }
