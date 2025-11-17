@@ -1,9 +1,6 @@
 __pycache__/
-*.csv
-*.tsf
 .vscode/
 .DS_Store
 .env
 .venv/
-src/outputs
 src/hybridts.egg-info
