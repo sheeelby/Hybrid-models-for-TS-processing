@@ -1,11 +1,14 @@
 {
   "categories": ["yearly", "quarterly", "monthly"],
-  "n_per_cat": 50,
+  "n_per_cat": 10,
   "pick": "random",
   "seed": 42,
-  "epochs": 10,
-  "base_models": ["timesnet", "nbeats", "helformer"],
+  "epochs": 40,
+  "base_models": ["timesnet", "nbeats"],
   "wavelet": "db4",
   "level": 1,
-  "force_rebuild_csv": false
+  "boundary": "wrap",
+  "force_rebuild_csv": false,
+  "force_rebuild_global_components": false,
+  "visualize": false
 }

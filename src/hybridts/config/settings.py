@@ -31,6 +31,7 @@ class Settings:
     data_dir: Path
     m3_csv_dir: Path
     m3_tsf_dir: Path
+    m4_csv_dir: Path
     outputs_dir: Path
 
     @classmethod
@@ -46,6 +47,7 @@ class Settings:
                 data_dir.mkdir(parents=True, exist_ok=True)
         m3_csv_dir = Path(env.get("M3_CSV_DIR", data_dir / "m3" / "csv")).expanduser().resolve()
         m3_tsf_dir = Path(env.get("M3_TSF_DIR", data_dir / "m3" / "tsf")).expanduser().resolve()
+        m4_csv_dir = Path(env.get("M4_CSV_DIR", data_dir / "m4" / "csv")).expanduser().resolve()
         outputs_dir = Path(env.get("OUTPUTS_DIR", root / "outputs")).resolve()
         outputs_dir.mkdir(parents=True, exist_ok=True)
         return cls(
@@ -53,6 +55,7 @@ class Settings:
             data_dir=data_dir,
             m3_csv_dir=m3_csv_dir,
             m3_tsf_dir=m3_tsf_dir,
+            m4_csv_dir=m4_csv_dir,
             outputs_dir=outputs_dir,
         )
 

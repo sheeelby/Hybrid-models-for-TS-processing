@@ -6,6 +6,14 @@ import pywt
 from scipy.ndimage import convolve1d
 
 
+def _mode(mode: str) -> str:
+    mode = str(mode).lower()
+    # convolve1d supports: reflect, constant, nearest, mirror, wrap.
+    if mode not in {"reflect", "constant", "nearest", "mirror", "wrap"}:
+        raise ValueError(f"Unsupported boundary mode '{mode}'")
+    return mode
+
+
 def upArrow_op(li, j):
     if j == 0:
         return [1]
@@ -29,24 +37,27 @@ def period_list(li, N):
     return li
 
 
-def circular_convolve_mra(h_j_o, w_j):
+def circular_convolve_mra(h_j_o, w_j, *, mode: str = "wrap"):
+    mode = _mode(mode)
     return convolve1d(
         w_j,
         np.flip(h_j_o),
-        mode="wrap",
+        mode=mode,
         origin=(len(h_j_o) - 1) // 2,
     )
 
 
-def circular_convolve_d(h_t, v_j_1, j):
+def circular_convolve_d(h_t, v_j_1, j, *, mode: str = "wrap"):
+    mode = _mode(mode)
     N = len(v_j_1)
     ker = np.zeros(len(h_t) * 2 ** (j - 1))
     for i, h in enumerate(h_t):
         ker[i * 2 ** (j - 1)] = h
-    return convolve1d(v_j_1, ker, mode="wrap", origin=-len(ker) // 2)
+    return convolve1d(v_j_1, ker, mode=mode, origin=-len(ker) // 2)
 
 
-def circular_convolve_s(h_t, g_t, w_j, v_j, j):
+def circular_convolve_s(h_t, g_t, w_j, v_j, j, *, mode: str = "wrap"):
+    mode = _mode(mode)
     N = len(v_j)
     h_ker = np.zeros(len(h_t) * 2 ** (j - 1))
     g_ker = np.zeros(len(g_t) * 2 ** (j - 1))
@@ -56,19 +67,20 @@ def circular_convolve_s(h_t, g_t, w_j, v_j, j):
     v_j_1 = convolve1d(
         w_j,
         np.flip(h_ker),
-        mode="wrap",
+        mode=mode,
         origin=(len(h_ker) - 1) // 2,
     )
     v_j_1 += convolve1d(
         v_j,
         np.flip(g_ker),
-        mode="wrap",
+        mode=mode,
         origin=(len(g_ker) - 1) // 2,
     )
     return v_j_1
 
 
-def modwt(x, filters, level):
+def modwt(x, filters, level, *, mode: str = "wrap"):
+    mode = _mode(mode)
     wavelet = pywt.Wavelet(filters)
     h = wavelet.dec_hi
     g = wavelet.dec_lo
@@ -77,14 +89,15 @@ def modwt(x, filters, level):
     wavecoeff = []
     v_j_1 = x
     for j in range(level):
-        w = circular_convolve_d(h_t, v_j_1, j + 1)
-        v_j_1 = circular_convolve_d(g_t, v_j_1, j + 1)
+        w = circular_convolve_d(h_t, v_j_1, j + 1, mode=mode)
+        v_j_1 = circular_convolve_d(g_t, v_j_1, j + 1, mode=mode)
         wavecoeff.append(w)
     wavecoeff.append(v_j_1)
     return np.vstack(wavecoeff)
 
 
-def imodwt(w, filters):
+def imodwt(w, filters, *, mode: str = "wrap"):
+    mode = _mode(mode)
     wavelet = pywt.Wavelet(filters)
     h = wavelet.dec_hi
     g = wavelet.dec_lo
@@ -94,11 +107,12 @@ def imodwt(w, filters):
     v_j = w[-1]
     for jp in range(level):
         j = level - jp - 1
-        v_j = circular_convolve_s(h_t, g_t, w[j], v_j, j + 1)
+        v_j = circular_convolve_s(h_t, g_t, w[j], v_j, j + 1, mode=mode)
     return v_j
 
 
-def modwtmra(w, filters):
+def modwtmra(w, filters, *, mode: str = "wrap"):
+    mode = _mode(mode)
     wavelet = pywt.Wavelet(filters)
     h = wavelet.dec_hi
     g = wavelet.dec_lo
@@ -115,13 +129,13 @@ def modwtmra(w, filters):
         if j == 0:
             h_j_t = h / np.sqrt(2)
         h_j_t_o = period_list(h_j_t, N)
-        D.append(circular_convolve_mra(h_j_t_o, w[j]))
+        D.append(circular_convolve_mra(h_j_t_o, w[j], mode=mode))
     j = level - 1
     g_j_up = upArrow_op(g, j + 1)
     g_j = np.convolve(g_j_part, g_j_up)
     g_j_t = g_j / (2 ** ((j + 1) / 2.0))
     g_j_t_o = period_list(g_j_t, N)
-    S = circular_convolve_mra(g_j_t_o, w[-1])
+    S = circular_convolve_mra(g_j_t_o, w[-1], mode=mode)
     D.append(S)
     return np.vstack(D)
 

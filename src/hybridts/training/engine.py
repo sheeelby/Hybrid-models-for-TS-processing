@@ -24,6 +24,9 @@ class TrainConfig:
     weight_decay: float = 1e-4
     clip: Optional[float] = 1.0
     device: Optional[str] = None
+    # Optional auxiliary loss weights (used only if a model exposes matching attributes).
+    # Kept in TrainConfig so pipelines can control behaviour without changing model code.
+    diff_loss_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if self.device is None:
@@ -40,10 +43,11 @@ def train_model(model: torch.nn.Module, dataset: Dataset, cfg: TrainConfig):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     loss_fn = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, cfg.epochs))
 
     epoch_iter = range(cfg.epochs)
     if tqdm is not None:
-        epoch_iter = tqdm(epoch_iter, desc="Helformer train", leave=False)
+        epoch_iter = tqdm(epoch_iter, desc=f"train ({model.__class__.__name__})", leave=False)
 
     model.train()
     for _ in epoch_iter:
@@ -57,11 +61,20 @@ def train_model(model: torch.nn.Module, dataset: Dataset, cfg: TrainConfig):
             else:
                 preds = model(xb)
             loss = loss_fn(preds, yb)
+
+            # Smoothness / anti-spike regularization.
+            # If enabled, match first differences between prediction and target.
+            w = float(getattr(model, "diff_loss_weight", cfg.diff_loss_weight))
+            if w > 0 and preds.ndim == 2 and yb.ndim == 2 and preds.size(1) >= 2:
+                dp = preds[:, 1:] - preds[:, :-1]
+                dt = yb[:, 1:] - yb[:, :-1]
+                loss = loss + w * loss_fn(dp, dt)
             loss.backward()
 
             if cfg.clip is not None:
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.clip)
             optimizer.step()
+        scheduler.step()
 
     model.eval()
     return model

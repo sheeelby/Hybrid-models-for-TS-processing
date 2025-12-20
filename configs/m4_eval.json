@@ -1,0 +1,24 @@
+{
+  "categories": ["quarterly"],
+  "n_per_cat": 5,
+  "pick": "random",
+  "seed": 42,
+  "epochs": 40,
+  "base_models": [
+    "vw_timesnet_ets",
+    "vw_timesnet_arima_auto",
+    "vw_nbeats_ets",
+    "vw_nbeats_arima_auto"
+  ],
+  "wavelet": "db4",
+  "level": 5,
+  "boundary": "wrap",
+  "plot_test_only": true,
+  "use_full_modwt_components": true,
+  "simulate_full_series": true,
+  "simulation_mode": "rollout",
+  "simulation_train_only_plot": true,
+  "force_rebuild_csv": false,
+  "force_rebuild_global_components": false,
+  "visualize": true
+}

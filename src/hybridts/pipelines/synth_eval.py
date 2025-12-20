@@ -5,14 +5,14 @@ We generate large synthetic series under several regimes:
 - with/without seasonality
 - with low / high noise
 
-The same hybrid pipeline (TimesNet/N-BEATS/Helformer + MODWT) and classical
+The same hybrid pipeline (TimesNet/N-BEATS + MODWT) and classical
 baselines (ARIMA, auto-ARIMA, ETS, Prophet) are evaluated on all regimes.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,16 +20,19 @@ import torch
 
 from ..config.settings import settings
 from ..data import best_L, mse, mape, plot_forecast, rmse, smape, seasonal_naive
-from ..hybrids import HybridPlus
-from ..models import (
-    HelformerAutoRegressor,
-    arima_forecast,
-    auto_arima_forecast,
-    ets_forecast,
-    make_model,
-    prophet_forecast,
-)
-from ..training import TrainConfig, WindowDatasetStd, train_model
+from ..hybrids import HybridPlus, VWHybridMixed
+from ..models import arima_forecast, auto_arima_forecast, ets_forecast, make_model, prophet_forecast
+from ..training import TrainConfig
+from ..viz import save_component_forecast_plot, save_series_viz_bundle
+
+MODEL_LABELS = {
+    "timesnet": "TimesNet+",
+    "nbeats": "N-Beats+",
+    "vw_timesnet_ets": "VW + TimesNet + ETS",
+    "vw_timesnet_arima_auto": "VW + TimesNet + Arima_auto",
+    "vw_nbeats_ets": "VW + N-Beats + ETS",
+    "vw_nbeats_arima_auto": "VW + N-Beats + Arima_auto",
+}
 
 
 @dataclass(frozen=True)
@@ -110,11 +113,33 @@ def _generate_series(
     return y.astype(float)
 
 
-def _base_factory(name: str):
+def _base_factory(name: str, params: Mapping[str, Any] | None = None):
     def _fn(cfg: TrainConfig):
-        return make_model(name, cfg)
+        return make_model(name, cfg, params=params)
 
     return _fn
+
+
+def _effective_model_params(
+    model_name: str,
+    *,
+    base_model_name: str | None = None,
+    seasonal_period: int | None,
+    model_params: Mapping[str, Mapping[str, Any]] | None,
+) -> Mapping[str, Any] | None:
+    base_name = (base_model_name or model_name).lower()
+    primary = model_name.lower()
+    params_raw = None
+    if model_params:
+        params_raw = model_params.get(primary)
+        if params_raw is None and base_name != primary:
+            params_raw = model_params.get(base_name)
+    params = dict(params_raw) if params_raw else None
+    if base_name == "nbeats" and (seasonal_period is None or seasonal_period <= 1):
+        if params is None:
+            params = {}
+        params.setdefault("use_seasonality", False)
+    return params
 
 
 def evaluate_synth_hybrids(
@@ -128,11 +153,15 @@ def evaluate_synth_hybrids(
     out_prefix: Path | None = None,
     wavelet: str = "db4",
     level: int = 1,
+    boundary: str = "wrap",
     plot: bool = True,
+    visualize: bool = False,
+    model_params: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """Run hybrid + baseline models on synthetic series."""
-    base_models = tuple((m.lower() for m in (base_models or ("timesnet", "nbeats", "helformer"))))
-    label_map = {name: name.title() + "+" for name in base_models if name != "helformer"}
+    base_models = tuple((m.lower() for m in (base_models or ("timesnet", "nbeats"))))
+    label_map = {name: MODEL_LABELS.get(name, name.title() + "+") for name in base_models}
+    hybrid_models = base_models
 
     use_profiles: Tuple[SynthProfile, ...]
     if profiles is None:
@@ -150,7 +179,6 @@ def evaluate_synth_hybrids(
     rows: List[Dict] = []
 
     for profile in use_profiles:
-        helformer_state = None
         per = profile.season_period or 1
         for idx in range(n_per_profile):
             series_id = f"{profile.name}_{idx+1}"
@@ -172,18 +200,63 @@ def evaluate_synth_hybrids(
             )
 
             forecasts: Dict[str, np.ndarray] = {}
+            component_forecasts: Dict[str, Dict[str, np.ndarray]] = {}
             # Hybrid neural models (TimesNet / N-BEATS)
-            hybrid_models = tuple(m for m in base_models if m != "helformer")
             for model_name in hybrid_models:
                 label = label_map[model_name]
                 try:
-                    model = HybridPlus(
-                        base_model_fn=_base_factory(model_name),
-                        cfg=cfg,
-                        wavelet=wavelet,
-                        level=level,
-                    ).fit(y_tr)
+                    per_eff = per if per and per > 1 else None
+                    if model_name in {"timesnet", "nbeats"}:
+                        params = _effective_model_params(
+                            model_name,
+                            seasonal_period=per_eff,
+                            model_params=model_params,
+                        )
+                        model = HybridPlus(
+                            base_model_fn=_base_factory(model_name, params=params),
+                            cfg=cfg,
+                            wavelet=wavelet,
+                            level=level,
+                            boundary=boundary,
+                            seasonal_period=per_eff,
+                        ).fit(y_tr)
+                    elif model_name in {"vw_timesnet_ets", "vw_timesnet_arima_auto"}:
+                        detail = "ets" if model_name.endswith("_ets") else "arima_auto"
+                        aj_params = _effective_model_params(
+                            model_name,
+                            base_model_name="timesnet",
+                            seasonal_period=per_eff,
+                            model_params=model_params,
+                        )
+                        model = VWHybridMixed(
+                            aj_model_fn=_base_factory("timesnet", params=aj_params),
+                            detail_method=detail,
+                            cfg=cfg,
+                            wavelet=wavelet,
+                            level=level,
+                            seasonal_period=per_eff,
+                        ).fit(y_tr)
+                    elif model_name in {"vw_nbeats_ets", "vw_nbeats_arima_auto"}:
+                        detail = "ets" if model_name.endswith("_ets") else "arima_auto"
+                        aj_params = _effective_model_params(
+                            model_name,
+                            base_model_name="nbeats",
+                            seasonal_period=per_eff,
+                            model_params=model_params,
+                        )
+                        model = VWHybridMixed(
+                            aj_model_fn=_base_factory("nbeats", params=aj_params),
+                            detail_method=detail,
+                            cfg=cfg,
+                            wavelet=wavelet,
+                            level=level,
+                            seasonal_period=per_eff,
+                        ).fit(y_tr)
+                    else:
+                        raise ValueError(f"Unknown hybrid model '{model_name}'")
                     forecasts[label] = model.forecast(y_tr)
+                    if hasattr(model, "forecast_components"):
+                        component_forecasts[label] = model.forecast_components(y_tr)  # type: ignore[assignment]
                 except Exception as exc:
                     print(f"[{profile.name}:{series_id}] {label} failed: {exc}")
 
@@ -208,54 +281,6 @@ def evaluate_synth_hybrids(
             except Exception as exc:
                     print(f"[{profile.name}:{series_id}] Prophet failed: {exc}")
 
-            # Helformer baseline (no MODWT), trained directly on the original series
-            if "helformer" in base_models:
-                try:
-                    ds_h = WindowDatasetStd(y_tr, L, horizon, stride=1, scale=True)
-                    if len(ds_h) > 0:
-                        n_samples = len(ds_h)
-                        batch = 8 if n_samples < 8 else 16 if n_samples < 32 else 32 if n_samples < 128 else 64
-                        extra_epochs = 96 if n_samples < 8 else 64 if n_samples < 32 else 40 if n_samples < 128 else 32
-                        if n_samples < 8:
-                            lr_h = 3e-3
-                        elif n_samples < 32:
-                            lr_h = 2e-3
-                        else:
-                            lr_h = 1e-3
-                        cfg_h = TrainConfig(
-                            lookback=L,
-                            horizon=horizon,
-                            epochs=max(epochs, extra_epochs),
-                            batch_size=batch,
-                            lr=lr_h,
-                            weight_decay=1e-5,
-                            clip=0.5,
-                        )
-                        model_h = HelformerAutoRegressor(
-                            horizon=horizon,
-                            input_dim=1,
-                            num_heads=2,
-                            head_dim=32,
-                            lstm_units=96,
-                            dropout=0.15,
-                            use_decomposition=False,
-                        )
-                        if helformer_state is not None:
-                            model_h.load_state_dict(helformer_state)
-                        model_h = train_model(model_h, ds_h, cfg_h)
-                        if model_h is not None:
-                            mu, sd = ds_h.scaler
-                            xb_raw = (y_tr[-L:] - mu) / (sd if sd != 0 else 1.0)
-                            xb = torch.from_numpy(xb_raw.astype(np.float32)).view(1, -1, 1)
-                            xb = xb.to(cfg_h.device)
-                            with torch.no_grad():
-                                pred_h = model_h(xb).cpu().numpy().ravel()
-                            pred_h = pred_h * (sd if sd != 0 else 1.0) + mu
-                            forecasts["Helformer"] = pred_h
-                            helformer_state = {k: v.detach().cpu() for k, v in model_h.state_dict().items()}
-                except Exception as exc:
-                    print(f"[{profile.name}:{series_id}] Helformer failed: {exc}")
-
             if not forecasts:
                 # Fallback: seasonal naive or last-value persistence
                 naive = seasonal_naive(y_tr, horizon, per)
@@ -275,10 +300,34 @@ def evaluate_synth_hybrids(
                 rec[f"{key}_MSE"] = mse(y_te, pred)
             rows.append(rec)
 
-            if plot:
+            title = f"{profile.name} {series_id} (H={horizon}, L={L})"
+            if visualize:
+                save_series_viz_bundle(
+                    out_dir=out_dir / "viz",
+                    series_key=series_id,
+                    title_prefix=title,
+                    y_tr=y_tr,
+                    y_te=y_te,
+                    forecasts=forecasts,
+                    wavelet=wavelet,
+                    level=level,
+                    boundary=boundary,
+                    component_forecasts=component_forecasts if component_forecasts else None,
+                )
+            elif plot:
                 save_png = out_dir / f"{series_id}.png"
-                title = f"{profile.name} {series_id} (H={horizon}, L={L})"
                 plot_forecast(title, y_tr, y_te, forecasts, save_path=save_png)
+                if component_forecasts:
+                    save_component_forecast_plot(
+                        y_tr=y_tr,
+                        y_te=y_te,
+                        component_forecasts=component_forecasts,
+                        wavelet=wavelet,
+                        level=level,
+                        boundary=boundary,
+                        title=f"{title} component forecasts",
+                        save_path=out_dir / f"{series_id}_components.png",
+                    )
 
     df = pd.DataFrame(rows)
     metrics_csv = out_dir / "metrics.csv"

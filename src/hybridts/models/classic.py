@@ -1,4 +1,3 @@
-"""Классические статистические модели (ARIMA, ETS) для M3."""
 from __future__ import annotations
 
 from contextlib import nullcontext
@@ -6,32 +5,31 @@ from typing import Iterable, Tuple
 
 import numpy as np
 
-try:  # pragma: no cover - импорт проверяется при запуске пайплайна
+try:
     from statsmodels.tsa.arima.model import ARIMA
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
-except Exception:  # pragma: no cover - statsmodels обязателен, но подстрахуемся
-    ARIMA = None  # type: ignore[assignment]
-    ExponentialSmoothing = None  # type: ignore[assignment]
+except Exception:  
+    ARIMA = None 
+    ExponentialSmoothing = None
 
-
-try:  # pragma: no cover - ACF/PACF �?�+�?�����'��>��?
+try:
     from statsmodels.tsa.stattools import acf, pacf
-except Exception:  # pragma: no cover
-    acf = None  # type: ignore[assignment]
-    pacf = None  # type: ignore[assignment]
+except Exception:
+    acf = None
+    pacf = None
 
-try:  # pragma: no cover - Prophet �?�+�?�����'��>��?
+try:
     import pandas as pd
     from prophet import Prophet
 
     try:
         from cmdstanpy.utils import disable_logging as _disable_cmdstanpy_logging
-    except Exception:  # pragma: no cover - cmdstanpy optional in some envs
+    except Exception:
         _disable_cmdstanpy_logging = None
-except Exception:  # pragma: no cover
-    pd = None  # type: ignore[assignment]
-    Prophet = None  # type: ignore[assignment]
-    _disable_cmdstanpy_logging = None  # type: ignore[assignment]
+except Exception:
+    pd = None
+    Prophet = None
+    _disable_cmdstanpy_logging = None
 
 def _repeat_last(y: np.ndarray, horizon: int) -> np.ndarray:
     if horizon <= 0:
@@ -41,6 +39,53 @@ def _repeat_last(y: np.ndarray, horizon: int) -> np.ndarray:
     return np.repeat(float(y[-1]), horizon).astype(float)
 
 
+def _clean_series(y: Iterable[float]) -> np.ndarray:
+    data = np.asarray(list(y), dtype=float)
+    if data.size == 0:
+        return data
+    mask = np.isfinite(data)
+    if not np.all(mask):
+        data = data[mask]
+    return data.astype(float, copy=False)
+
+
+def _linear_extrapolation(y: np.ndarray, horizon: int, window: int = 32) -> np.ndarray:
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    if y.size == 0:
+        return np.zeros(horizon, dtype=float)
+    n = int(y.size)
+    w = int(min(max(2, window), n))
+    t = np.arange(w, dtype=float)
+    y_w = y[-w:].astype(float, copy=False)
+    y_mean = float(np.mean(y_w))
+    y_centered = y_w - y_mean
+    slope, intercept = np.polyfit(t, y_centered, deg=1)
+    future_t = np.arange(w, w + horizon, dtype=float)
+    return (slope * future_t + intercept + y_mean).astype(float)
+
+
+def _arima_trend_for_d(d: int) -> str:
+    return "t" if int(d) > 0 else "c"
+
+
+def _fit_forecast_arima(data: np.ndarray, horizon: int, order: Tuple[int, int, int]) -> np.ndarray:
+    if ARIMA is None:
+        raise RuntimeError("statsmodels не установлен, ARIMA недоступна")
+    p, d, q = (int(order[0]), int(order[1]), int(order[2]))
+    trend = _arima_trend_for_d(d)
+    model = ARIMA(
+        data,
+        order=(p, d, q),
+        trend=trend,
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+    fitted = model.fit(method_kwargs={"warn_convergence": False, "maxiter": 200})
+    forecast = fitted.forecast(steps=horizon)
+    return np.asarray(forecast, dtype=float)
+
+
 def _auto_arima_order(
     data: np.ndarray,
     d: int = 1,
@@ -48,12 +93,6 @@ def _auto_arima_order(
     max_p: int = 3,
     max_q: int = 3,
 ) -> Tuple[int, int, int]:
-    """Heuristic ARIMA(p,d,q) order selection from ACF/PACF.
-
-    Uses significance bands ~ 1.96/sqrt(N) and picks the largest
-    significant lag for PACF -> p, ACF -> q, with small caps.
-    Falls back to (1,d,0) on any failure.
-    """
     n = int(data.size)
     if n < 10 or acf is None or pacf is None:  # type: ignore[truthy-function]
         return (1, d, 0)
@@ -75,26 +114,27 @@ def _auto_arima_order(
 def arima_forecast(
     y: Iterable[float],
     horizon: int,
-    order: Tuple[int, int, int] = (1, 1, 0),
+    order: Tuple[int, int, int] = (1, 1, 1),
 ) -> np.ndarray:
-    """Прогноз ARIMA(p,d,q). Используем statsmodels, fallback — повтор последнего значения."""
-    if ARIMA is None:  # pragma: no cover - защита от отсутствующей зависимости
+
+    if ARIMA is None:
         raise RuntimeError("statsmodels не установлен, ARIMA недоступна")
-    data = np.asarray(list(y), dtype=float)
-    if data.size < 4:
-        return _repeat_last(data, horizon)
+    
+    data = _clean_series(y)
+    if data.size < 6:
+        return _linear_extrapolation(data, horizon)
     try:
-        model = ARIMA(
-            data,
-            order=order,
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        )
-        fitted = model.fit(method_kwargs={"warn_convergence": False})
-        forecast = fitted.forecast(steps=horizon)
-        return np.asarray(forecast, dtype=float)
+        forecast = _fit_forecast_arima(data, horizon, order=order)
+        if np.nanstd(forecast) < 1e-12 and np.nanstd(np.diff(data[-min(16, data.size) :])) > 1e-12:
+            return _linear_extrapolation(data, horizon)
+        return forecast
     except Exception:
-        return _repeat_last(data, horizon)
+        for alt in ((0, 1, 1), (1, 1, 0), (0, 1, 0), (1, 0, 1)):
+            try:
+                return _fit_forecast_arima(data, horizon, order=alt)
+            except Exception:
+                continue
+        return _linear_extrapolation(data, horizon)
 
 
 def ets_forecast(
@@ -104,8 +144,7 @@ def ets_forecast(
     trend: str | None = "add",
     seasonal: str | None = "add",
 ) -> np.ndarray:
-    """Прогноз ETS из statsmodels. Если сезонность не задана — строим только тренд."""
-    if ExponentialSmoothing is None:  # pragma: no cover
+    if ExponentialSmoothing is None:
         raise RuntimeError("statsmodels не установлен, ETS недоступна")
     data = np.asarray(list(y), dtype=float)
     if data.size < 4:
@@ -130,25 +169,46 @@ def auto_arima_forecast(
     y: Iterable[float],
     horizon: int,
 ) -> np.ndarray:
-    """ARIMA(p,d,q) с автоматическим выбором p и q по ACF/PACF."""
-    if ARIMA is None:  # pragma: no cover
+    if ARIMA is None:
         raise RuntimeError("statsmodels не установлен, ARIMA недоступна")
-    data = np.asarray(list(y), dtype=float)
-    if data.size < 4:
-        return _repeat_last(data, horizon)
+    data = _clean_series(y)
+    if data.size < 6:
+        return _linear_extrapolation(data, horizon)
     try:
         p, d, q = _auto_arima_order(data)
-        model = ARIMA(
-            data,
-            order=(p, d, q),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        )
-        fitted = model.fit(method_kwargs={"warn_convergence": False})
-        forecast = fitted.forecast(steps=horizon)
-        return np.asarray(forecast, dtype=float)
+        forecast = _fit_forecast_arima(data, horizon, order=(p, d, q))
+        if np.nanstd(forecast) < 1e-12 and np.nanstd(np.diff(data[-min(16, data.size) :])) > 1e-12:
+            return _linear_extrapolation(data, horizon)
+        return forecast
     except Exception:
-        return _repeat_last(data, horizon)
+        best_aic = np.inf
+        best_order: Tuple[int, int, int] | None = None
+        for d in (0, 1):
+            for p in range(0, 3):
+                for q in range(0, 3):
+                    if p == 0 and q == 0 and d == 0:
+                        continue
+                    try:
+                        model = ARIMA(
+                            data,
+                            order=(p, d, q),
+                            trend=_arima_trend_for_d(d),
+                            enforce_stationarity=False,
+                            enforce_invertibility=False,
+                        )
+                        fitted = model.fit(method_kwargs={"warn_convergence": False, "maxiter": 100})
+                        aic = float(getattr(fitted, "aic", np.inf))
+                        if np.isfinite(aic) and aic < best_aic:
+                            best_aic = aic
+                            best_order = (p, d, q)
+                    except Exception:
+                        continue
+        if best_order is not None:
+            try:
+                return _fit_forecast_arima(data, horizon, order=best_order)
+            except Exception:
+                pass
+        return _linear_extrapolation(data, horizon)
 
 
 def prophet_forecast(
@@ -156,8 +216,7 @@ def prophet_forecast(
     horizon: int,
     freq: str = "D",
 ) -> np.ndarray:
-    """Baseline Prophet forecast with simple additive seasonality."""
-    if Prophet is None or pd is None:  # pragma: no cover
+    if Prophet is None or pd is None:
         raise RuntimeError("prophet не установлен, Prophet недоступен")
     data = np.asarray(list(y), dtype=float)
     if data.size < 2:

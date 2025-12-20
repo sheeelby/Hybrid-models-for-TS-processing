@@ -117,7 +117,7 @@ def load_train_tsts(cat: str, csv_dir: Path | None = None) -> List[Tuple[str, np
     return data
 
 
-def best_L(y_tr: np.ndarray, H: int, per: int, Lmin: int = 16, Lcap: int = 192) -> int:
+def best_L(y_tr: np.ndarray, H: int, per: int, Lmin: int = 16, Lcap: int = 512) -> int:
     """Choose a safe, dynamically-sized lookback for an M3 series.
 
     The desired lookback scales with the horizon and seasonal period, but it is
@@ -203,20 +203,86 @@ def plot_forecast(title: str, y_tr: np.ndarray, y_te: np.ndarray, forecasts: Dic
     xs_tr = np.arange(len(y_tr))
     xs_te = np.arange(len(y_tr)-1, len(y_tr) + H)
     last_tr = np.array([y_tr[-1]])
-    plt.figure(figsize=(8, 3.2))
-    plt.plot(xs_tr, y_tr, label="train")
-    plt.plot(xs_te, np.hstack([last_tr, y_te]), label="test")
+    fig, ax = plt.subplots(figsize=(10.5, 4.6))
+    ax.plot(xs_tr, y_tr, label="train", linewidth=1.8, color="C0")
+    ax.plot(xs_te, np.hstack([last_tr, y_te]), label="test", linewidth=2.0, color="C3")
     for k, v in forecasts.items():
-        plt.plot(xs_te, np.hstack([last_tr, v]), label=k)
-    plt.title(title)
-    plt.xlabel("t")
-    plt.legend()
+        ax.plot(
+            xs_te,
+            np.hstack([last_tr, v]),
+            label=k,
+            linewidth=1.7,
+            alpha=0.95,
+            linestyle="--",
+        )
+
+    # Visual separation between train and forecast horizon.
+    ax.axvline(x=len(y_tr) - 1, color="0.35", linestyle="--", linewidth=1.0, alpha=0.7)
+
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel("t")
+    ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.25)
+    ax.minorticks_on()
+    ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.18)
+
+    # Add a little padding so lines don't stick to the frame.
+    all_series = [np.asarray(y_tr, float), np.asarray(y_te, float)] + [np.asarray(v, float) for v in forecasts.values()]
+    ymin = float(np.nanmin([np.nanmin(s) for s in all_series if s.size > 0]))
+    ymax = float(np.nanmax([np.nanmax(s) for s in all_series if s.size > 0]))
+    pad = 0.06 * (ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+    ax.legend(fontsize=8, ncol=2, frameon=False)
+    fig.tight_layout()
     if save_path:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, bbox_inches="tight", dpi=120)
+        fig.savefig(save_path, bbox_inches="tight", dpi=160)
     # plt.show()
-    plt.close()
+    plt.close(fig)
+
+
+def plot_forecast_test_only(
+    title: str,
+    y_te: np.ndarray,
+    forecasts: Dict[str, np.ndarray],
+    save_path: Path | None = None,
+):
+    import matplotlib.pyplot as plt
+
+    y_te = np.asarray(y_te, float).ravel()
+    H = int(y_te.size)
+    if H <= 0:
+        return
+
+    xs = np.arange(H)
+    fig, ax = plt.subplots(figsize=(10.5, 4.6))
+    ax.plot(xs, y_te, label="test", linewidth=2.0, color="C3")
+    for k, v in forecasts.items():
+        v = np.asarray(v, float).ravel()
+        if v.size != H:
+            continue
+        ax.plot(xs, v, label=k, linewidth=1.7, alpha=0.95, linestyle="--")
+
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel("t (test)")
+    ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.25)
+    ax.minorticks_on()
+    ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.18)
+
+    all_series = [y_te] + [np.asarray(v, float) for v in forecasts.values()]
+    ymin = float(np.nanmin([np.nanmin(s) for s in all_series if s.size > 0]))
+    ymax = float(np.nanmax([np.nanmax(s) for s in all_series if s.size > 0]))
+    pad = 0.06 * (ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+    ax.legend(fontsize=8, ncol=2, frameon=False)
+    fig.tight_layout()
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight", dpi=160)
+    plt.close(fig)
 
 
 __all__ = [
@@ -226,6 +292,7 @@ __all__ = [
     "load_train_tsts",
     "best_L",
     "plot_forecast",
+    "plot_forecast_test_only",
     "seasonal_naive",
     "smape",
     "mape",

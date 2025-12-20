@@ -1,0 +1,19 @@
+{
+  "categories": ["yearly", "quarterly", "monthly"],
+  "n_per_cat": 10,
+  "pick": "random",
+  "seed": 42,
+  "epochs": 20,
+  "base_models": [
+    "vw_timesnet_ets",
+    "vw_timesnet_arima_auto",
+    "vw_nbeats_ets",
+    "vw_nbeats_arima_auto"
+  ],
+  "wavelet": "db4",
+  "level": 3,
+  "boundary": "wrap",
+  "force_rebuild_csv": false,
+  "force_rebuild_global_components": true,
+  "visualize": true
+}

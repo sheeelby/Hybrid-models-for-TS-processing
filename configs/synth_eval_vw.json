@@ -11,9 +11,16 @@
   "length": 400,
   "horizon": 24,
   "epochs": 8,
-  "base_models": ["timesnet", "nbeats"],
+  "base_models": [
+    "timesnet",
+    "nbeats",
+    "vw_timesnet_ets",
+    "vw_timesnet_arima_auto",
+    "vw_nbeats_ets",
+    "vw_nbeats_arima_auto"
+  ],
   "seed": 42,
   "wavelet": "db4",
-  "level": 5,
+  "level": 1,
   "visualize": true
 }
