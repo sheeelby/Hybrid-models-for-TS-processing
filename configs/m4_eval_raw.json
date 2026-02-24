@@ -1,0 +1,18 @@
+{
+  "categories": ["quarterly"],
+  "n_per_cat": 5,
+  "pick": "random",
+  "seed": 42,
+  "epochs": 40,
+  "base_models": ["raw_timesnet", "raw_nbeats"],
+  "wavelet": "db4",
+  "level": 5,
+  "boundary": "wrap",
+  "plot_test_only": true,
+  "use_full_modwt_components": false,
+  "simulate_full_series": false,
+  "force_rebuild_csv": false,
+  "force_rebuild_global_components": false,
+  "visualize": true
+}
+

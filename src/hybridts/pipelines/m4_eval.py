@@ -30,7 +30,7 @@ from ..data import (
 )
 from ..hybrids import HybridComponent, HybridPlus, VWHybridMixed, build_global_hybrid_components
 from ..hybrids.modwt_hybrid import modwt_decompose_with_boundary
-from ..models import arima_forecast, auto_arima_forecast, ets_forecast, make_model, prophet_forecast
+from ..models import DirectNeuralForecaster, arima_forecast, auto_arima_forecast, ets_forecast, make_model, prophet_forecast
 from ..training import TrainConfig
 from ..viz import (
     save_component_forecast_plot,
@@ -39,6 +39,8 @@ from ..viz import (
     save_simulation_full_plot,
     save_simulation_train_plot,
 )
+
+from ._csv_checkpoints import append_row, reset_csv
 
 
 def _fitted_one_step_series(
@@ -104,6 +106,66 @@ def _fitted_one_step_series(
     return out
 
 
+def _fitted_one_step_series_direct(
+    forecaster: DirectNeuralForecaster,
+    y_tr: np.ndarray,
+    *,
+    device: str,
+    total_len: int | None = None,
+    mode: str = "rollout",
+) -> np.ndarray:
+    y_tr = np.asarray(y_tr, float).ravel()
+    n = int(y_tr.size)
+    if n == 0:
+        return y_tr
+    if total_len is None:
+        total_len = n
+    total_len = int(max(1, total_len))
+
+    model = forecaster.model
+    lookback = int(forecaster.lookback or 0)
+    if model is None or lookback <= 0 or n <= 2:
+        out = np.empty(total_len, dtype=float)
+        init_len = min(n, total_len)
+        out[:init_len] = y_tr[:init_len]
+        for t in range(1, init_len):
+            out[t] = out[t - 1]
+        for t in range(init_len, total_len):
+            out[t] = out[t - 1]
+        return out
+
+    mu = float(forecaster.mu)
+    sd = float(forecaster.sd + 1e-8)
+    lookback = min(lookback, max(1, n - 1))
+
+    out = np.empty(total_len, dtype=float)
+    init_len = min(lookback, n, total_len)
+    out[:init_len] = y_tr[:init_len]
+    if init_len < lookback:
+        for t in range(init_len, min(lookback, total_len)):
+            out[t] = out[t - 1]
+        init_len = min(lookback, total_len)
+
+    model.eval()
+    mode = str(mode or "rollout").lower()
+    for t in range(init_len, total_len):
+        if mode == "fitted" and t < n:
+            window = y_tr[max(0, t - lookback) : t]
+            if window.size < lookback:
+                pad = np.repeat(window[0] if window.size else out[0], lookback - window.size)
+                window = np.concatenate([pad, window])
+        else:
+            window = out[t - lookback : t]
+        xb = ((window - mu) / sd).astype(np.float32).reshape(1, 1, -1)
+        with torch.no_grad():
+            pred = model(torch.from_numpy(xb).to(device)).detach().cpu().numpy().ravel()
+        if pred.size <= 0:
+            out[t] = out[t - 1]
+        else:
+            out[t] = float(pred[0]) * sd + mu
+    return out
+
+
 def _progress(iterable, **kwargs):
     if tqdm is None:
         return iterable
@@ -113,11 +175,35 @@ def _progress(iterable, **kwargs):
 MODEL_LABELS = {
     "timesnet": "TimesNet+",
     "nbeats": "N-BEATS Full",
+    "raw_timesnet": "TimesNet (raw)",
+    "raw_nbeats": "N-BEATS (raw)",
     "vw_timesnet_ets": "VW + TimesNet + ETS",
     "vw_timesnet_arima_auto": "VW + TimesNet + Arima_auto",
     "vw_nbeats_ets": "VW + N-Beats + ETS",
     "vw_nbeats_arima_auto": "VW + N-Beats + Arima_auto",
 }
+
+
+def _normalize_model_name(name: str) -> str:
+    name = str(name).strip().lower()
+    if name.startswith("raw_"):
+        return name
+    if name.endswith("_raw"):
+        base = name[: -len("_raw")]
+        return f"raw_{base}"
+    if name.startswith("direct_"):
+        base = name[len("direct_") :]
+        return f"raw_{base}"
+    return name
+
+
+def _raw_base_name(model_name: str) -> str | None:
+    model_name = _normalize_model_name(model_name)
+    if model_name.startswith("raw_"):
+        base = model_name[len("raw_") :]
+        if base in {"timesnet", "nbeats"}:
+            return base
+    return None
 
 
 def _base_factory(name: str, params: Mapping[str, Any] | None = None):
@@ -186,7 +272,7 @@ def evaluate_m4_hybrids(
     simulation_train_only_plot: bool = False,
     model_params: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    base_models = tuple((m.lower() for m in (base_models or ("timesnet", "nbeats"))))
+    base_models = tuple((_normalize_model_name(m) for m in (base_models or ("timesnet", "nbeats"))))
     label_map = {name: MODEL_LABELS.get(name, f"{name.title()}+") for name in base_models}
     hybrid_models = base_models
 
@@ -200,6 +286,11 @@ def evaluate_m4_hybrids(
         categories=categories,
         force_rebuild=force_rebuild_csv,
     )
+
+    metrics_csv = out_dir / "metrics.csv"
+    summary_csv = out_dir / "summary.csv"
+    reset_csv(metrics_csv)
+    reset_csv(summary_csv)
 
     rng = np.random.default_rng(seed)
     np.random.seed(seed)
@@ -215,6 +306,11 @@ def evaluate_m4_hybrids(
         "daily": "D",
         "hourly": "H",
     }
+    model_order = list(dict.fromkeys([label_map[name] for name in hybrid_models] + ["ARIMA", "ARIMA_auto", "ETS", "Prophet"]))
+    metric_names = ("sMAPE", "MAPE", "RMSE", "MSE")
+    metric_cols = [f"{name.replace(' ', '_')}_{metric}" for name in model_order for metric in metric_names]
+    series_columns = ["category", "series_id", *metric_cols]
+    summary_columns = ["category", "n_series", *metric_cols]
     for cat in _progress(categories, desc="Categories"):
         cat = str(cat).lower()
         if cat not in M4_H:
@@ -355,6 +451,7 @@ def evaluate_m4_hybrids(
                 except Exception as exc:
                     print(f"[m4:{cat}] failed to save hybrid components for {model_name}: {exc}")
 
+        cat_rows: List[Dict] = []
         for sid, y_tr, y_te in _progress(selected_list, desc=f"{cat} series", leave=False):
             L = best_L(y_tr, H, per)
             comps_override: list[np.ndarray] | None = None
@@ -416,6 +513,26 @@ def evaluate_m4_hybrids(
                             y_sim = np.sum(np.stack(fitted_components, 0), axis=0)
                             # If we simulated beyond train+H (shouldn't), trim.
                             simulations[label] = np.asarray(y_sim[:total_len], float)
+                    elif (raw_base := _raw_base_name(model_name)) is not None:
+                        params = _effective_model_params(
+                            model_name,
+                            base_model_name=raw_base,
+                            seasonal_period=per_eff,
+                            model_params=model_params,
+                        )
+                        model = DirectNeuralForecaster(
+                            base_model_fn=_base_factory(raw_base, params=params),
+                            cfg=cfg,
+                        ).fit(y_tr)
+                        forecasts[label] = model.forecast(y_tr)
+                        if simulate_full_series:
+                            simulations[label] = _fitted_one_step_series_direct(
+                                model,
+                                np.asarray(y_tr, float),
+                                device=cfg.device,
+                                total_len=total_len,
+                                mode=simulation_mode,
+                            )
                     elif model_name in {"vw_timesnet_ets", "vw_timesnet_arima_auto"}:
                         detail = "ets" if model_name.endswith("_ets") else "arima_auto"
                         aj_params = _effective_model_params(
@@ -525,7 +642,9 @@ def evaluate_m4_hybrids(
                     label = label_map[model_name]
                     forecasts[label] = naive.copy()
 
-            rec = {"category": cat, "series_id": sid}
+            rec: Dict[str, Any] = {"category": cat, "series_id": sid}
+            for col in metric_cols:
+                rec[col] = np.nan
             for name, pred in forecasts.items():
                 key = name.replace(" ", "_")
                 rec[f"{key}_sMAPE"] = smape(y_te, pred)
@@ -533,6 +652,8 @@ def evaluate_m4_hybrids(
                 rec[f"{key}_RMSE"] = rmse(y_te, pred)
                 rec[f"{key}_MSE"] = mse(y_te, pred)
             rows.append(rec)
+            cat_rows.append(rec)
+            append_row(metrics_csv, rec, series_columns)
 
             title = f"{cat.upper()} {sid} (H={H}, L={L})"
             if visualize:
@@ -610,10 +731,18 @@ def evaluate_m4_hybrids(
                             save_path=out_dir / f"{cat}_{sid}_simulation_full.png",
                         )
 
+        if cat_rows:
+            cat_df = pd.DataFrame(cat_rows)
+            summary_rec: Dict[str, Any] = {"category": cat, "n_series": len(cat_rows)}
+            for col in metric_cols:
+                summary_rec[col] = float(cat_df[col].mean(skipna=True))
+            append_row(summary_csv, summary_rec, summary_columns)
+
     df = pd.DataFrame(rows)
     metrics_csv = out_dir / "metrics.csv"
     df.to_csv(metrics_csv, index=False)
-    print(f"[saved] metrics: {metrics_csv}")
+    print(f"[saved] metrics (per-series): {metrics_csv}")
+    print(f"[saved] summary (per-category): {summary_csv}")
     if df.empty:
         print("No results generated — check CSV/logs.")
         return df

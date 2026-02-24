@@ -29,6 +29,7 @@ from ..data import (
 from ..hybrids import HybridComponent, HybridPlus, build_global_hybrid_components
 from ..hybrids import VWHybridMixed
 from ..models import (
+    DirectNeuralForecaster,
     arima_forecast,
     auto_arima_forecast,
     ets_forecast,
@@ -38,6 +39,8 @@ from ..models import (
 from ..training import TrainConfig
 from ..viz import save_component_forecast_plot, save_series_viz_bundle
 
+from ._csv_checkpoints import append_row, reset_csv
+
 def _progress(iterable, **kwargs):
     if tqdm is None:
         return iterable
@@ -46,11 +49,35 @@ def _progress(iterable, **kwargs):
 MODEL_LABELS = {
     "timesnet": "TimesNet+",
     "nbeats": "N-BEATS Full",
+    "raw_timesnet": "TimesNet (raw)",
+    "raw_nbeats": "N-BEATS (raw)",
     "vw_timesnet_ets": "VW + TimesNet + ETS",
     "vw_timesnet_arima_auto": "VW + TimesNet + Arima_auto",
     "vw_nbeats_ets": "VW + N-Beats + ETS",
     "vw_nbeats_arima_auto": "VW + N-Beats + Arima_auto",
 }
+
+
+def _normalize_model_name(name: str) -> str:
+    name = str(name).strip().lower()
+    if name.startswith("raw_"):
+        return name
+    if name.endswith("_raw"):
+        base = name[: -len("_raw")]
+        return f"raw_{base}"
+    if name.startswith("direct_"):
+        base = name[len("direct_") :]
+        return f"raw_{base}"
+    return name
+
+
+def _raw_base_name(model_name: str) -> str | None:
+    model_name = _normalize_model_name(model_name)
+    if model_name.startswith("raw_"):
+        base = model_name[len("raw_") :]
+        if base in {"timesnet", "nbeats"}:
+            return base
+    return None
 
 
 def _base_factory(name: str, params: Mapping[str, Any] | None = None):
@@ -101,7 +128,7 @@ def evaluate_m3_hybrids(
     visualize: bool = False,
     model_params: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    base_models = tuple((m.lower() for m in (base_models or ("timesnet", "nbeats"))))
+    base_models = tuple((_normalize_model_name(m) for m in (base_models or ("timesnet", "nbeats"))))
     label_map = {name: MODEL_LABELS.get(name, f"{name.title()}+") for name in base_models}
     hybrid_models = base_models
 
@@ -112,6 +139,11 @@ def evaluate_m3_hybrids(
 
     ensure_m3_csv(csv_dir=csv_dir, tsf_dir=tsf_dir, force_rebuild=force_rebuild_csv)
 
+    metrics_csv = out_dir / "metrics.csv"
+    summary_csv = out_dir / "summary.csv"
+    reset_csv(metrics_csv)
+    reset_csv(summary_csv)
+
     rng = np.random.default_rng(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -119,6 +151,11 @@ def evaluate_m3_hybrids(
     rows: List[Dict] = []
     categories = tuple(categories)
     freq_map = {"yearly": "YE", "quarterly": "QE", "monthly": "ME"}
+    model_order = list(dict.fromkeys([label_map[name] for name in hybrid_models] + ["ARIMA", "ARIMA_auto", "ETS", "Prophet"]))
+    metric_names = ("sMAPE", "MAPE", "RMSE", "MSE")
+    metric_cols = [f"{name.replace(' ', '_')}_{metric}" for name in model_order for metric in metric_names]
+    series_columns = ["category", "series_id", *metric_cols]
+    summary_columns = ["category", "n_series", *metric_cols]
     for cat in _progress(categories, desc="Categories"):
         H = M3_H[cat]
         per = M3_P[cat]
@@ -257,6 +294,8 @@ def evaluate_m3_hybrids(
                 torch.save(payload, hybrid_ckpt)
             except Exception as exc:
                 print(f"[{cat}] failed to save hybrid components for {model_name}: {exc}")
+
+        cat_rows: List[Dict] = []
         for sid, y_tr, y_te in _progress(selected_list, desc=f"{cat} series", leave=False):
             L = best_L(y_tr, H, per)
             cfg = TrainConfig(
@@ -291,6 +330,18 @@ def evaluate_m3_hybrids(
                         ).fit(y_tr)
                         forecasts[label] = model.forecast(y_tr)
                         component_forecasts[label] = model.forecast_components(y_tr)
+                    elif (raw_base := _raw_base_name(model_name)) is not None:
+                        params = _effective_model_params(
+                            model_name,
+                            base_model_name=raw_base,
+                            seasonal_period=per_eff,
+                            model_params=model_params,
+                        )
+                        model = DirectNeuralForecaster(
+                            base_model_fn=_base_factory(raw_base, params=params),
+                            cfg=cfg,
+                        ).fit(y_tr)
+                        forecasts[label] = model.forecast(y_tr)
                     elif model_name in {"vw_timesnet_ets", "vw_timesnet_arima_auto"}:
                         detail = "ets" if model_name.endswith("_ets") else "arima_auto"
                         aj_params = _effective_model_params(
@@ -355,7 +406,9 @@ def evaluate_m3_hybrids(
                 for model_name in base_models:
                     label = label_map[model_name]
                     forecasts[label] = naive.copy()
-            rec = {"category": cat, "series_id": sid}
+            rec: Dict[str, Any] = {"category": cat, "series_id": sid}
+            for col in metric_cols:
+                rec[col] = np.nan
             for name, pred in forecasts.items():
                 key = name.replace(" ", "_")
                 rec[f"{key}_sMAPE"] = smape(y_te, pred)
@@ -363,6 +416,8 @@ def evaluate_m3_hybrids(
                 rec[f"{key}_RMSE"] = rmse(y_te, pred)
                 rec[f"{key}_MSE"] = mse(y_te, pred)
             rows.append(rec)
+            cat_rows.append(rec)
+            append_row(metrics_csv, rec, series_columns)
             title = f"{cat.upper()} {sid} (H={H}, L={L})"
             if visualize:
                 series_key = f"{cat}_{sid}"
@@ -393,10 +448,16 @@ def evaluate_m3_hybrids(
                         save_path=out_dir / f"{cat}_{sid}_components.png",
                     )
 
+        if cat_rows:
+            cat_df = pd.DataFrame(cat_rows)
+            summary_rec: Dict[str, Any] = {"category": cat, "n_series": len(cat_rows)}
+            for col in metric_cols:
+                summary_rec[col] = float(cat_df[col].mean(skipna=True))
+            append_row(summary_csv, summary_rec, summary_columns)
+
     df = pd.DataFrame(rows)
-    metrics_csv = out_dir / "metrics.csv"
-    df.to_csv(metrics_csv, index=False)
-    print(f"[saved] metrics: {metrics_csv}")
+    print(f"[saved] metrics (per-series): {metrics_csv}")
+    print(f"[saved] summary (per-category): {summary_csv}")
     if not df.empty:
         metric_suffixes = {
             "sMAPE": "_sMAPE",

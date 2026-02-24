@@ -1,10 +1,12 @@
 """Base model implementations and factories."""
 from .classic import arima_forecast, ets_forecast, auto_arima_forecast, prophet_forecast
+from .direct_forecaster import DirectNeuralForecaster
 from .factory import make_model
 from .nbeats import NBEATSV2
 from .timesnet import TimesNetV2
 
 __all__ = [
+    "DirectNeuralForecaster",
     "make_model",
     "NBEATSV2",
     "TimesNetV2",

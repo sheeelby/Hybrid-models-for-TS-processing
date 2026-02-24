@@ -9,7 +9,7 @@ from torch.utils.data import TensorDataset
 
 from ..training import TrainConfig, WindowDatasetStd, train_model
 from ..models.classic import auto_arima_forecast, ets_forecast
-from . import modwt as ext_modw
+from . import modwt as ext_modwt
 
 
 def _filter_len(wname: str) -> int:
@@ -191,10 +191,14 @@ class HybridPlus:
 
     def _prepare_component(self, comp: np.ndarray) -> HybridComponent:
         Lmax = len(comp) - self.cfg.horizon
-        if Lmax < 16:
+        min_windows = 8
+        if Lmax <= 0:
             return HybridComponent(None, float(comp.mean()), float(comp.std() + 1e-8), None, per_series_scaling=False)
-        L = min(self.cfg.lookback, Lmax)
+        L = int(min(self.cfg.lookback, max(1, Lmax)))
         ds = WindowDatasetStd(comp, L, self.cfg.horizon, stride=1, scale=True)
+        if len(ds) < min_windows:
+            mu, sd = ds.scaler
+            return HybridComponent(None, float(mu), float(sd), None, per_series_scaling=False)
         mu, sd = ds.scaler
         model = self.base_model_fn(self.cfg)
         trained = train_model(model, ds, self.cfg)
@@ -388,10 +392,14 @@ class VWHybridMixed:
 
     def _prepare_component(self, comp: np.ndarray) -> HybridComponent:
         Lmax = len(comp) - self.cfg.horizon
-        if Lmax < 16:
+        min_windows = 8
+        if Lmax <= 0:
             return HybridComponent(None, float(comp.mean()), float(comp.std() + 1e-8), None)
-        L = min(self.cfg.lookback, Lmax)
+        L = int(min(self.cfg.lookback, max(1, Lmax)))
         ds = WindowDatasetStd(comp, L, self.cfg.horizon, stride=1, scale=True)
+        if len(ds) < min_windows:
+            mu, sd = ds.scaler
+            return HybridComponent(None, float(mu), float(sd), None)
         mu, sd = ds.scaler
         model = self.aj_model_fn(self.cfg)
         trained = train_model(model, ds, self.cfg)
