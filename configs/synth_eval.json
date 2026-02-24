@@ -1,17 +1,21 @@
 {
   "profiles": [
-    "flat_low_noise",
-    "trend_only",
-    "season_only",
-    "trend_season",
-    "trend_season_high_noise",
-    "season_high_noise"
+    "nonseasonal_sample",
+    "seasonal_sample",
+    "complex_seasonality_examples"
   ],
-  "n_per_profile": 2,
+  "n_per_profile": 1,
   "length": 400,
   "horizon": 24,
   "epochs": 8,
-  "base_models": ["timesnet", "nbeats"],
+  "base_models": [
+    "raw_timesnet",
+    "raw_nbeats",
+    "vw_timesnet_ets",
+    "vw_timesnet_arima_auto",
+    "vw_nbeats_ets",
+    "vw_nbeats_arima_auto"
+  ],
   "seed": 42,
   "wavelet": "db4",
   "level": 5,
