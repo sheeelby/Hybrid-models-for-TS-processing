@@ -356,6 +356,7 @@ def evaluate_m3_hybrids(
                             cfg=cfg,
                             wavelet=wavelet,
                             level=cat_level,
+                            boundary=boundary,
                             seasonal_period=per_eff,
                         ).fit(y_tr)
                         forecasts[label] = model.forecast(y_tr)
@@ -374,6 +375,7 @@ def evaluate_m3_hybrids(
                             cfg=cfg,
                             wavelet=wavelet,
                             level=cat_level,
+                            boundary=boundary,
                             seasonal_period=per_eff,
                         ).fit(y_tr)
                         forecasts[label] = model.forecast(y_tr)

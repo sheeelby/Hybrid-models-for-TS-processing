@@ -508,6 +508,7 @@ class VWHybridMixed:
         detail_dampen_tau: float = 3.0,
         residual_anchor: bool = True,
         residual_transition_steps: int = 6,
+        enable_output_blend: bool = True,
     ) -> None:
         self.aj_model_fn = aj_model_fn
         self.detail_method = str(detail_method).lower()
@@ -532,6 +533,7 @@ class VWHybridMixed:
         self.detail_dampen_tau = float(detail_dampen_tau)
         self.residual_anchor = bool(residual_anchor)
         self.residual_transition_steps = int(residual_transition_steps)
+        self.enable_output_blend = bool(enable_output_blend)
         self.aj_component: HybridComponent | None = None
         self.detail_policies: list[VWDetailPolicy] = []
         self.detail_residual_scale: float = 1.0
@@ -651,16 +653,22 @@ class VWHybridMixed:
             # extra conservative grid for noisy details
             candidates_alpha.extend([0.0, 0.25, 0.5, 0.75])
             for alpha in candidates_alpha:
-                pred = alpha * pred_raw
+                policy = VWDetailPolicy(
+                    method=method,
+                    seasonal_period=(int(seasonal_period) if seasonal_period else None),
+                    blend_zero=float(np.clip(alpha, 0.0, 1.0)),
+                    amp_limit=amp_limit,
+                )
+                try:
+                    # Score the *actual* forecast path (with damping/anchoring/clipping),
+                    # otherwise policy selection and inference use different objectives.
+                    pred = self._forecast_detail(hist, policy=policy)
+                except Exception:
+                    continue
                 score = _weighted_rmse(pred, tgt, w)
                 if score < best_score:
                     best_score = score
-                    best_policy = VWDetailPolicy(
-                        method=method,
-                        seasonal_period=(int(seasonal_period) if seasonal_period else None),
-                        blend_zero=float(np.clip(alpha, 0.0, 1.0)),
-                        amp_limit=amp_limit,
-                    )
+                    best_policy = policy
         return best_policy
 
     def _fit_detail_policies(self, details: Sequence[np.ndarray]) -> None:
@@ -789,7 +797,12 @@ class VWHybridMixed:
         self._fit_detail_policies(D)
         self._calibrate_detail_residual_scale(D)
         self.aj_component = self._prepare_component(A)
-        self._calibrate_output_blend(y)
+        if self.enable_output_blend:
+            self._calibrate_output_blend(y)
+        else:
+            self.output_blend_kind = "none"
+            self.output_blend_alpha = 1.0
+            self.output_blend_period = None
         return self
 
     def _forecast_neural(self, component: HybridComponent, comp: np.ndarray) -> np.ndarray:
@@ -890,7 +903,7 @@ class VWHybridMixed:
             yhat = np.pad(yhat, (0, H - yhat.size), mode="edge")
         yhat = _stabilize_reconstruction_boundary(y, yhat)
 
-        if self.output_blend_kind != "none" and self.output_blend_alpha < 0.999:
+        if self.enable_output_blend and self.output_blend_kind != "none" and self.output_blend_alpha < 0.999:
             try:
                 base = self._baseline_forecast_raw(
                     np.asarray(y, float),

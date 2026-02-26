@@ -547,6 +547,7 @@ def evaluate_m4_hybrids(
                             cfg=cfg,
                             wavelet=wavelet,
                             level=cat_level,
+                            boundary=boundary,
                             seasonal_period=per_eff,
                         ).fit(y_tr, components_override=comps_override)
                         forecasts[label] = model.forecast(y_tr, components_override=comps_override)
@@ -587,6 +588,7 @@ def evaluate_m4_hybrids(
                             cfg=cfg,
                             wavelet=wavelet,
                             level=cat_level,
+                            boundary=boundary,
                             seasonal_period=per_eff,
                         ).fit(y_tr, components_override=comps_override)
                         forecasts[label] = model.forecast(y_tr, components_override=comps_override)
