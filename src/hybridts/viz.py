@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 
@@ -105,30 +105,37 @@ def save_acf_pacf_plot(
     plt.close(fig)
 
 
-def save_modwt_decomposition_plots(
+def save_decomposition_plots(
     *,
     y: np.ndarray,
-    wavelet: str,
-    level: int,
+    decomposition_method: str = "modwt",
+    wavelet: str = "db4",
+    level: int = 1,
     boundary: str = "wrap",
+    seasonal_period: int | None = None,
+    stl_kwargs: Mapping[str, Any] | None = None,
     title_prefix: str,
     out_dir: Path,
 ) -> None:
     import matplotlib.pyplot as plt
 
-    from .hybrids.modwt_hybrid import modwt_decompose_with_boundary
+    from .hybrids.decomposition import DecompositionSpec, decompose_series, describe_decomposition
 
     y = _clean_series(y)
     if y.size < 2:
         return
 
     out_dir = _ensure_dir(Path(out_dir))
-    A, D = modwt_decompose_with_boundary(
-        y, wavelet=wavelet, level=level, boundary=boundary, check=True
+    spec = DecompositionSpec(
+        method=decomposition_method,
+        wavelet=wavelet,
+        level=level,
+        boundary=boundary,
+        seasonal_period=seasonal_period,
+        stl_kwargs=stl_kwargs,
     )
-    components = [("A_J", np.asarray(A, float))] + [
-        (f"D_{j+1}", np.asarray(comp, float)) for j, comp in enumerate(D)
-    ]
+    result = decompose_series(y, spec=spec, check=True)
+    components = list(zip(result.names, result.components))
 
     # One combined figure for quick inspection.
     fig, axes = plt.subplots(len(components), 1, figsize=(10.5, 2.2 * len(components)), sharex=True)
@@ -141,7 +148,7 @@ def save_modwt_decomposition_plots(
         ax.minorticks_on()
         ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.18)
     axes[-1].set_xlabel("t")
-    fig.suptitle(f"{title_prefix} MODWT ({wavelet}, level={level}, boundary={boundary})", fontsize=10)
+    fig.suptitle(f"{title_prefix} {describe_decomposition(spec)}", fontsize=10)
     fig.tight_layout()
     fig.savefig(out_dir / "components.png", bbox_inches="tight", dpi=160)
     plt.close(fig)
@@ -158,6 +165,26 @@ def save_modwt_decomposition_plots(
         fig.tight_layout()
         fig.savefig(out_dir / f"{name}.png", bbox_inches="tight", dpi=160)
         plt.close(fig)
+
+
+def save_modwt_decomposition_plots(
+    *,
+    y: np.ndarray,
+    wavelet: str,
+    level: int,
+    boundary: str = "wrap",
+    title_prefix: str,
+    out_dir: Path,
+) -> None:
+    save_decomposition_plots(
+        y=y,
+        decomposition_method="modwt",
+        wavelet=wavelet,
+        level=level,
+        boundary=boundary,
+        title_prefix=title_prefix,
+        out_dir=out_dir,
+    )
 
 
 def save_forecast_zoom_plot(
@@ -361,26 +388,42 @@ def save_series_viz_bundle(
     y_tr: np.ndarray,
     y_te: np.ndarray,
     forecasts: Dict[str, np.ndarray],
-    wavelet: str,
-    level: int,
+    wavelet: str = "db4",
+    level: int = 1,
     boundary: str = "wrap",
+    seasonal_period: int | None = None,
+    stl_kwargs: Mapping[str, Any] | None = None,
+    decomposition_specs: Mapping[str, object] | None = None,
     acf_lags: int = 48,
     zoom_tail: int = 120,
-    component_forecasts: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
+    component_forecasts_by_group: Optional[Dict[str, Dict[str, Dict[str, np.ndarray]]]] = None,
 ) -> None:
     """Save per-series plots into named subfolders under out_dir.
 
     The directory structure is:
     - 01_raw_series/<series_key>.png
     - 02_acf_pacf/<series_key>.png
-    - 03_modwt/<series_key>/* (components)
+    - 03_<decomposition>/<series_key>/* (components)
     - 04_forecast_zoom/<series_key>.png
     - 05_forecast_full/<series_key>.png
-    - 06_component_forecasts/<series_key>.png (optional)
+    - 06_component_forecasts[_<decomposition>]/<series_key>.png (optional)
     - 07_forecast_test_only/<series_key>.png
-    - 08_component_forecasts_test_only/<series_key>.png (optional)
+    - 08_component_forecasts_test_only[_<decomposition>]/<series_key>.png (optional)
     """
+    from .hybrids.decomposition import DecompositionSpec
+
     out_dir = Path(out_dir)
+    if decomposition_specs is None:
+        decomposition_specs = {
+            "modwt": DecompositionSpec(
+                method="modwt",
+                wavelet=wavelet,
+                level=level,
+                boundary=boundary,
+                seasonal_period=seasonal_period,
+                stl_kwargs=stl_kwargs,
+            )
+        }
     save_raw_series_plot(
         y_tr=y_tr,
         y_te=y_te,
@@ -393,14 +436,19 @@ def save_series_viz_bundle(
         save_path=out_dir / "02_acf_pacf" / f"{series_key}.png",
         nlags=acf_lags,
     )
-    save_modwt_decomposition_plots(
-        y=y_tr,
-        wavelet=wavelet,
-        level=level,
-        boundary=boundary,
-        title_prefix=title_prefix,
-        out_dir=out_dir / "03_modwt" / series_key,
-    )
+    for group_key, spec_obj in decomposition_specs.items():
+        spec = spec_obj if isinstance(spec_obj, DecompositionSpec) else DecompositionSpec(**dict(spec_obj))
+        save_decomposition_plots(
+            y=y_tr,
+            decomposition_method=spec.method,
+            wavelet=spec.wavelet,
+            level=spec.level,
+            boundary=spec.boundary,
+            seasonal_period=spec.seasonal_period,
+            stl_kwargs=spec.stl_kwargs,
+            title_prefix=title_prefix,
+            out_dir=out_dir / f"03_{group_key}" / series_key,
+        )
     save_forecast_zoom_plot(
         y_tr=y_tr,
         y_te=y_te,
@@ -427,27 +475,30 @@ def save_series_viz_bundle(
         save_path=out_dir / "07_forecast_test_only" / f"{series_key}.png",
     )
 
-    if component_forecasts:
-        save_component_forecast_plot(
-            y_tr=np.asarray(y_tr, float),
-            y_te=np.asarray(y_te, float),
-            component_forecasts=component_forecasts,
-            wavelet=wavelet,
-            level=level,
-            boundary=boundary,
-            title=f"{title_prefix} component forecasts",
-            save_path=out_dir / "06_component_forecasts" / f"{series_key}.png",
-        )
-        save_component_forecast_test_only_plot(
-            y_tr=np.asarray(y_tr, float),
-            y_te=np.asarray(y_te, float),
-            component_forecasts=component_forecasts,
-            wavelet=wavelet,
-            level=level,
-            boundary=boundary,
-            title=f"{title_prefix} component forecasts (test only)",
-            save_path=out_dir / "08_component_forecasts_test_only" / f"{series_key}.png",
-        )
+    if component_forecasts_by_group:
+        multiple_groups = len(component_forecasts_by_group) > 1
+        for group_key, component_forecasts in component_forecasts_by_group.items():
+            spec_obj = decomposition_specs.get(group_key)
+            if spec_obj is None:
+                continue
+            spec = spec_obj if isinstance(spec_obj, DecompositionSpec) else DecompositionSpec(**dict(spec_obj))
+            suffix = f"_{group_key}" if multiple_groups else ""
+            save_component_forecast_plot(
+                y_tr=np.asarray(y_tr, float),
+                y_te=np.asarray(y_te, float),
+                component_forecasts=component_forecasts,
+                decomposition_spec=spec,
+                title=f"{title_prefix} component forecasts",
+                save_path=out_dir / f"06_component_forecasts{suffix}" / f"{series_key}.png",
+            )
+            save_component_forecast_test_only_plot(
+                y_tr=np.asarray(y_tr, float),
+                y_te=np.asarray(y_te, float),
+                component_forecasts=component_forecasts,
+                decomposition_spec=spec,
+                title=f"{title_prefix} component forecasts (test only)",
+                save_path=out_dir / f"08_component_forecasts_test_only{suffix}" / f"{series_key}.png",
+            )
 
 
 def save_component_forecast_plot(
@@ -455,20 +506,20 @@ def save_component_forecast_plot(
     y_tr: np.ndarray,
     y_te: np.ndarray,
     component_forecasts: Dict[str, Dict[str, np.ndarray]],
-    wavelet: str,
-    level: int,
+    decomposition_spec=None,
+    decomposition_method: str = "modwt",
+    wavelet: str = "db4",
+    level: int = 1,
     boundary: str = "wrap",
+    seasonal_period: int | None = None,
+    stl_kwargs: Mapping[str, Any] | None = None,
     title: str,
     save_path: Path,
 ) -> None:
-    """Plot Aj/Dj component forecasts for hybrid models.
-
-    component_forecasts maps model label -> {component_name: forecast (H,)}.
-    Supported component names: "A_J", "D_1", ..., "D_J".
-    """
+    """Plot component forecasts for hybrid models."""
     import matplotlib.pyplot as plt
 
-    from .hybrids.modwt_hybrid import modwt_decompose_with_boundary
+    from .hybrids.decomposition import DecompositionSpec, decompose_series
 
     y_tr = _clean_series(y_tr)
     y_te = _clean_series(y_te)
@@ -476,28 +527,35 @@ def save_component_forecast_plot(
     if y_tr.size < 2 or H <= 0:
         return
 
+    spec = decomposition_spec
+    if spec is None:
+        spec = DecompositionSpec(
+            method=decomposition_method,
+            wavelet=wavelet,
+            level=level,
+            boundary=boundary,
+            seasonal_period=seasonal_period,
+            stl_kwargs=stl_kwargs,
+        )
+
     y_full = np.concatenate([y_tr, y_te]).astype(float, copy=False)
-    A_full, D_full = modwt_decompose_with_boundary(
-        y_full, wavelet=wavelet, level=level, boundary=boundary, check=True
-    )
-    comps = [("A_J", np.asarray(A_full, float))] + [
-        (f"D_{j+1}", np.asarray(comp, float)) for j, comp in enumerate(D_full)
-    ]
+    result = decompose_series(y_full, spec=spec, check=True)
+    comps = list(zip(result.names, result.components))
 
     n = len(comps)
     fig, axes = plt.subplots(n, 1, figsize=(10.5, 2.2 * n), sharex=True)
     if n == 1:
         axes = [axes]
 
-    for ax, (cname, full) in zip(axes, comps):
+    for idx, (ax, (cname, full)) in enumerate(zip(axes, comps)):
         tr = full[: y_tr.size]
         te = full[y_tr.size :]
         xs_tr = np.arange(tr.size)
         xs_full = np.arange(y_tr.size + H)
         xs_te = np.arange(y_tr.size, y_tr.size + H)
 
-        ax.plot(xs_tr, tr, linewidth=1.6, color="C0", label="train" if cname == "A_J" else None)
-        ax.plot(xs_te, te, linewidth=1.8, color="C3", label="test" if cname == "A_J" else None)
+        ax.plot(xs_tr, tr, linewidth=1.6, color="C0", label="train" if idx == 0 else None)
+        ax.plot(xs_te, te, linewidth=1.8, color="C3", label="test" if idx == 0 else None)
         for model_label, comp_map in component_forecasts.items():
             pred = comp_map.get(cname)
             if pred is None:
@@ -512,7 +570,7 @@ def save_component_forecast_plot(
                 linewidth=1.4,
                 alpha=0.9,
                 linestyle="--",
-                label=model_label if cname == "A_J" else None,
+                label=model_label if idx == 0 else None,
             )
 
         ax.set_ylabel(cname)
@@ -538,16 +596,20 @@ def save_component_forecast_test_only_plot(
     y_tr: np.ndarray,
     y_te: np.ndarray,
     component_forecasts: Dict[str, Dict[str, np.ndarray]],
-    wavelet: str,
-    level: int,
+    decomposition_spec=None,
+    decomposition_method: str = "modwt",
+    wavelet: str = "db4",
+    level: int = 1,
     boundary: str = "wrap",
+    seasonal_period: int | None = None,
+    stl_kwargs: Mapping[str, Any] | None = None,
     title: str,
     save_path: Path,
 ) -> None:
-    """Plot Aj/Dj forecasts restricted to the test horizon (no train segment)."""
+    """Plot component forecasts restricted to the test horizon."""
     import matplotlib.pyplot as plt
 
-    from .hybrids.modwt_hybrid import modwt_decompose_with_boundary
+    from .hybrids.decomposition import DecompositionSpec, decompose_series
 
     y_tr = _clean_series(y_tr)
     y_te = _clean_series(y_te)
@@ -555,13 +617,20 @@ def save_component_forecast_test_only_plot(
     if y_tr.size < 2 or H <= 0:
         return
 
+    spec = decomposition_spec
+    if spec is None:
+        spec = DecompositionSpec(
+            method=decomposition_method,
+            wavelet=wavelet,
+            level=level,
+            boundary=boundary,
+            seasonal_period=seasonal_period,
+            stl_kwargs=stl_kwargs,
+        )
+
     y_full = np.concatenate([y_tr, y_te]).astype(float, copy=False)
-    A_full, D_full = modwt_decompose_with_boundary(
-        y_full, wavelet=wavelet, level=level, boundary=boundary, check=True
-    )
-    comps = [("A_J", np.asarray(A_full, float))] + [
-        (f"D_{j+1}", np.asarray(comp, float)) for j, comp in enumerate(D_full)
-    ]
+    result = decompose_series(y_full, spec=spec, check=True)
+    comps = list(zip(result.names, result.components))
 
     n = len(comps)
     fig, axes = plt.subplots(n, 1, figsize=(10.5, 2.2 * n), sharex=True)
@@ -569,9 +638,9 @@ def save_component_forecast_test_only_plot(
         axes = [axes]
 
     xs = np.arange(H)
-    for ax, (cname, full) in zip(axes, comps):
+    for idx, (ax, (cname, full)) in enumerate(zip(axes, comps)):
         te = full[y_tr.size :]
-        ax.plot(xs, te, linewidth=1.8, color="C3", label="test" if cname == "A_J" else None)
+        ax.plot(xs, te, linewidth=1.8, color="C3", label="test" if idx == 0 else None)
         for model_label, comp_map in component_forecasts.items():
             pred = comp_map.get(cname)
             if pred is None:
@@ -579,7 +648,7 @@ def save_component_forecast_test_only_plot(
             pred = np.asarray(pred, float).ravel()
             if pred.size != H:
                 continue
-            ax.plot(xs, pred, linewidth=1.4, alpha=0.9, linestyle="--", label=model_label if cname == "A_J" else None)
+            ax.plot(xs, pred, linewidth=1.4, alpha=0.9, linestyle="--", label=model_label if idx == 0 else None)
 
         ax.set_ylabel(cname)
         ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.25)
@@ -598,6 +667,7 @@ def save_component_forecast_test_only_plot(
 
 
 __all__ = [
+    "save_decomposition_plots",
     "save_series_viz_bundle",
     "save_component_forecast_plot",
     "save_component_forecast_test_only_plot",

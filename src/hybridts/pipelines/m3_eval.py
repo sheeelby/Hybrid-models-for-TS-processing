@@ -26,6 +26,7 @@ from ..data import (
     mse,
     rmse,
 )
+from ..hybrids.decomposition import DecompositionSpec, decompose_series
 from ..hybrids import HybridComponent, HybridPlus, build_global_hybrid_components
 from ..hybrids import VWHybridMixed
 from ..models import (
@@ -40,45 +41,12 @@ from ..training import TrainConfig
 from ..viz import save_component_forecast_plot, save_series_viz_bundle
 
 from ._csv_checkpoints import append_row, reset_csv
+from ._model_specs import parse_model_spec
 
 def _progress(iterable, **kwargs):
     if tqdm is None:
         return iterable
     return tqdm(iterable, **kwargs)
-
-MODEL_LABELS = {
-    "timesnet": "TimesNet+",
-    "nbeats": "N-BEATS Full",
-    "raw_timesnet": "TimesNet (raw)",
-    "raw_nbeats": "N-BEATS (raw)",
-    "vw_timesnet_ets": "VW + TimesNet + ETS",
-    "vw_timesnet_arima_auto": "VW + TimesNet + Arima_auto",
-    "vw_nbeats_ets": "VW + N-Beats + ETS",
-    "vw_nbeats_arima_auto": "VW + N-Beats + Arima_auto",
-}
-
-
-def _normalize_model_name(name: str) -> str:
-    name = str(name).strip().lower()
-    if name.startswith("raw_"):
-        return name
-    if name.endswith("_raw"):
-        base = name[: -len("_raw")]
-        return f"raw_{base}"
-    if name.startswith("direct_"):
-        base = name[len("direct_") :]
-        return f"raw_{base}"
-    return name
-
-
-def _raw_base_name(model_name: str) -> str | None:
-    model_name = _normalize_model_name(model_name)
-    if model_name.startswith("raw_"):
-        base = model_name[len("raw_") :]
-        if base in {"timesnet", "nbeats"}:
-            return base
-    return None
-
 
 def _base_factory(name: str, params: Mapping[str, Any] | None = None):
     def _fn(cfg: TrainConfig):
@@ -122,15 +90,14 @@ def evaluate_m3_hybrids(
     wavelet: str = "db4",
     level: int = 1,
     boundary: str = "wrap",
+    stl_kwargs: Mapping[str, Any] | None = None,
     force_rebuild_csv: bool = False,
     force_rebuild_global_components: bool = False,
     series_override: Mapping[str, Sequence[str]] | None = None,
     visualize: bool = False,
     model_params: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    base_models = tuple((_normalize_model_name(m) for m in (base_models or ("timesnet", "nbeats"))))
-    label_map = {name: MODEL_LABELS.get(name, f"{name.title()}+") for name in base_models}
-    hybrid_models = base_models
+    hybrid_models = tuple(parse_model_spec(m) for m in (base_models or ("timesnet", "nbeats")))
 
     csv_dir = Path(csv_dir or settings.m3_csv_dir)
     tsf_dir = Path(tsf_dir or settings.m3_tsf_dir)
@@ -151,7 +118,7 @@ def evaluate_m3_hybrids(
     rows: List[Dict] = []
     categories = tuple(categories)
     freq_map = {"yearly": "YE", "quarterly": "QE", "monthly": "ME"}
-    model_order = list(dict.fromkeys([label_map[name] for name in hybrid_models] + ["ARIMA", "ARIMA_auto", "ETS", "Prophet"]))
+    model_order = list(dict.fromkeys([spec.label for spec in hybrid_models] + ["ARIMA", "ARIMA_auto", "ETS", "Prophet"]))
     metric_names = ("sMAPE", "MAPE", "RMSE", "MSE")
     metric_cols = [f"{name.replace(' ', '_')}_{metric}" for name in model_order for metric in metric_names]
     series_columns = ["category", "series_id", *metric_cols]
@@ -183,15 +150,25 @@ def evaluate_m3_hybrids(
 
         # Global hybrid components for neural base models (TimesNet / N-BEATS).
         global_hybrid_components: Dict[str, List[HybridComponent]] = {}
-        for model_name in hybrid_models:
-            if model_name not in {"timesnet", "nbeats"}:
+        per_eff = per if per and per > 1 else None
+        for model_spec in hybrid_models:
+            if model_spec.kind != "hybrid_all":
                 continue
+            decomp_spec = DecompositionSpec(
+                method=model_spec.decomposition_method or "modwt",
+                wavelet=wavelet,
+                level=cat_level,
+                boundary=boundary,
+                seasonal_period=per_eff,
+                stl_kwargs=stl_kwargs,
+            )
             params = _effective_model_params(
-                model_name,
-                seasonal_period=(per if per and per > 1 else None),
+                model_spec.name,
+                base_model_name=model_spec.base_model_name,
+                seasonal_period=per_eff,
                 model_params=model_params,
             )
-            hybrid_ckpt = out_dir / f"{cat}_{model_name}_hybrid_global.pt"
+            hybrid_ckpt = out_dir / f"{cat}_{model_spec.name}_hybrid_global.pt"
             if hybrid_ckpt.exists() and not force_rebuild_global_components:
                 try:
                     ckpt = torch.load(hybrid_ckpt, map_location="cpu")
@@ -199,12 +176,20 @@ def evaluate_m3_hybrids(
                     # missing (older checkpoints), we accept them; otherwise validate.
                     if "horizon" in ckpt and int(ckpt.get("horizon", -1)) != int(H):
                         raise ValueError("checkpoint params mismatch")
-                    if "wavelet" in ckpt and ckpt.get("wavelet") != wavelet:
+                    if str(ckpt.get("decomposition_method", "modwt")).lower() != decomp_spec.method:
                         raise ValueError("checkpoint params mismatch")
-                    if "level" in ckpt and int(ckpt.get("level", -1)) != int(cat_level):
-                        raise ValueError("checkpoint params mismatch")
-                    if "boundary" in ckpt and str(ckpt.get("boundary", "wrap")).lower() != str(boundary).lower():
-                        raise ValueError("checkpoint params mismatch")
+                    if decomp_spec.method == "modwt":
+                        if "wavelet" in ckpt and ckpt.get("wavelet") != wavelet:
+                            raise ValueError("checkpoint params mismatch")
+                        if "level" in ckpt and int(ckpt.get("level", -1)) != int(cat_level):
+                            raise ValueError("checkpoint params mismatch")
+                        if "boundary" in ckpt and str(ckpt.get("boundary", "wrap")).lower() != str(boundary).lower():
+                            raise ValueError("checkpoint params mismatch")
+                    else:
+                        if "seasonal_period" in ckpt and ckpt.get("seasonal_period") != per_eff:
+                            raise ValueError("checkpoint params mismatch")
+                        if "stl_kwargs" in ckpt and dict(ckpt.get("stl_kwargs", {})) != dict(stl_kwargs or {}):
+                            raise ValueError("checkpoint params mismatch")
                     # Old checkpoints (before per-series scaling) often produce large
                     # level shifts ("downward drift") on M3. Rebuild them automatically.
                     comps_meta = list(ckpt.get("components", []))
@@ -229,7 +214,7 @@ def evaluate_m3_hybrids(
                                 weight_decay=1e-4,
                                 clip=1.0,
                             )
-                            model = _base_factory(model_name, params=params)(cfg_global)
+                            model = _base_factory(model_spec.base_model_name, params=params)(cfg_global)
                             model.load_state_dict(state_dict)
                             model.to(cfg_global.device)
                             model.eval()
@@ -243,10 +228,10 @@ def evaluate_m3_hybrids(
                             )
                         )
                     if comps:
-                        global_hybrid_components[model_name] = comps
+                        global_hybrid_components[model_spec.name] = comps
                         continue
                 except Exception as exc:
-                    print(f"[{cat}] failed to load hybrid components for {model_name}: {exc}")
+                    print(f"[{cat}] failed to load hybrid components for {model_spec.name}: {exc}")
             # No usable checkpoint -> build global components.
             try:
                 global_L = max(8, min(best_L(y_tr, H, per) for _, y_tr, _ in pairs))
@@ -264,20 +249,24 @@ def evaluate_m3_hybrids(
             comps = build_global_hybrid_components(
                 pairs,
                 hybrid_cfg,
-                base_model_fn=_base_factory(model_name, params=params),
+                base_model_fn=_base_factory(model_spec.base_model_name, params=params),
                 wavelet=wavelet,
                 level=cat_level,
                 boundary=boundary,
+                decompose_fn=lambda y_arr, spec=decomp_spec: decompose_series(y_arr, spec=spec, check=True).components,
             )
-            global_hybrid_components[model_name] = comps
+            global_hybrid_components[model_spec.name] = comps
             try:
                 payload = {
                     "category": cat,
-                    "model_name": model_name,
+                    "model_name": model_spec.name,
                     "horizon": H,
+                    "decomposition_method": decomp_spec.method,
                     "wavelet": wavelet,
                     "level": cat_level,
                     "boundary": boundary,
+                    "seasonal_period": per_eff,
+                    "stl_kwargs": dict(stl_kwargs or {}),
                     "components": [],
                 }
                 for comp in comps:
@@ -293,7 +282,7 @@ def evaluate_m3_hybrids(
                     )
                 torch.save(payload, hybrid_ckpt)
             except Exception as exc:
-                print(f"[{cat}] failed to save hybrid components for {model_name}: {exc}")
+                print(f"[{cat}] failed to save hybrid components for {model_spec.name}: {exc}")
 
         cat_rows: List[Dict] = []
         for sid, y_tr, y_te in _progress(selected_list, desc=f"{cat} series", leave=False):
@@ -308,80 +297,91 @@ def evaluate_m3_hybrids(
                 clip=0.5,
             )
             forecasts: Dict[str, np.ndarray] = {}
-            component_forecasts: Dict[str, Dict[str, np.ndarray]] = {}
-            for model_name in hybrid_models:
-                label = label_map[model_name]
+            decomposition_specs_for_viz: Dict[str, DecompositionSpec] = {}
+            component_forecasts_by_group: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+            decomp_cache: dict[tuple[Any, ...], Any] = {}
+            for model_spec in hybrid_models:
+                label = model_spec.label
                 try:
                     per_eff = per if per and per > 1 else None
-                    if model_name in {"timesnet", "nbeats"}:
+                    decomp_spec: DecompositionSpec | None = None
+                    comps_override: list[np.ndarray] | None = None
+                    component_names: tuple[str, ...] | None = None
+                    if model_spec.kind != "raw":
+                        decomp_spec = DecompositionSpec(
+                            method=model_spec.decomposition_method or "modwt",
+                            wavelet=wavelet,
+                            level=cat_level,
+                            boundary=boundary,
+                            seasonal_period=per_eff,
+                            stl_kwargs=stl_kwargs,
+                        )
+                        key = decomp_spec.cache_key()
+                        if key not in decomp_cache:
+                            decomp_cache[key] = decompose_series(y_tr, spec=decomp_spec, check=True)
+                        dec_result = decomp_cache[key]
+                        comps_override = [np.asarray(comp, float) for comp in dec_result.components]
+                        component_names = tuple(dec_result.names)
+                        decomposition_specs_for_viz[decomp_spec.group_key] = decomp_spec
+
+                    if model_spec.kind == "hybrid_all":
                         params = _effective_model_params(
-                            model_name,
+                            model_spec.name,
+                            base_model_name=model_spec.base_model_name,
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
                         model = HybridPlus(
-                            base_model_fn=_base_factory(model_name, params=params),
+                            base_model_fn=_base_factory(model_spec.base_model_name, params=params),
                             cfg=cfg,
                             wavelet=wavelet,
                             level=cat_level,
                             boundary=boundary,
-                            pretrained_components=global_hybrid_components.get(model_name),
+                            pretrained_components=global_hybrid_components.get(model_spec.name),
                             seasonal_period=per_eff,
-                        ).fit(y_tr)
-                        forecasts[label] = model.forecast(y_tr)
-                        component_forecasts[label] = model.forecast_components(y_tr)
-                    elif (raw_base := _raw_base_name(model_name)) is not None:
+                            component_names=component_names,
+                        ).fit(y_tr, components_override=comps_override)
+                        forecasts[label] = model.forecast(y_tr, components_override=comps_override)
+                        component_forecasts_by_group.setdefault(decomp_spec.group_key, {})[label] = model.forecast_components(
+                            y_tr,
+                            components_override=comps_override,
+                        )
+                    elif model_spec.kind == "raw":
                         params = _effective_model_params(
-                            model_name,
-                            base_model_name=raw_base,
+                            model_spec.name,
+                            base_model_name=model_spec.base_model_name,
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
                         model = DirectNeuralForecaster(
-                            base_model_fn=_base_factory(raw_base, params=params),
+                            base_model_fn=_base_factory(model_spec.base_model_name, params=params),
                             cfg=cfg,
                         ).fit(y_tr)
                         forecasts[label] = model.forecast(y_tr)
-                    elif model_name in {"vw_timesnet_ets", "vw_timesnet_arima_auto"}:
-                        detail = "ets" if model_name.endswith("_ets") else "arima_auto"
+                    elif model_spec.kind == "hybrid_mixed":
                         aj_params = _effective_model_params(
-                            model_name,
-                            base_model_name="timesnet",
+                            model_spec.name,
+                            base_model_name=model_spec.base_model_name,
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
                         model = VWHybridMixed(
-                            aj_model_fn=_base_factory("timesnet", params=aj_params),
-                            detail_method=detail,
+                            aj_model_fn=_base_factory(model_spec.base_model_name, params=aj_params),
+                            detail_method=str(model_spec.detail_method or "ets"),
                             cfg=cfg,
                             wavelet=wavelet,
                             level=cat_level,
                             boundary=boundary,
                             seasonal_period=per_eff,
-                        ).fit(y_tr)
-                        forecasts[label] = model.forecast(y_tr)
-                        component_forecasts[label] = model.forecast_components(y_tr)
-                    elif model_name in {"vw_nbeats_ets", "vw_nbeats_arima_auto"}:
-                        detail = "ets" if model_name.endswith("_ets") else "arima_auto"
-                        aj_params = _effective_model_params(
-                            model_name,
-                            base_model_name="nbeats",
-                            seasonal_period=per_eff,
-                            model_params=model_params,
+                            component_names=component_names,
+                        ).fit(y_tr, components_override=comps_override)
+                        forecasts[label] = model.forecast(y_tr, components_override=comps_override)
+                        component_forecasts_by_group.setdefault(decomp_spec.group_key, {})[label] = model.forecast_components(
+                            y_tr,
+                            components_override=comps_override,
                         )
-                        model = VWHybridMixed(
-                            aj_model_fn=_base_factory("nbeats", params=aj_params),
-                            detail_method=detail,
-                            cfg=cfg,
-                            wavelet=wavelet,
-                            level=cat_level,
-                            boundary=boundary,
-                            seasonal_period=per_eff,
-                        ).fit(y_tr)
-                        forecasts[label] = model.forecast(y_tr)
-                        component_forecasts[label] = model.forecast_components(y_tr)
                     else:
-                        raise ValueError(f"Unknown hybrid model '{model_name}'")
+                        raise ValueError(f"Unknown hybrid model '{model_spec.name}'")
                 except Exception as exc:
                     print(f"[{cat}:{sid}] {label} failed: {exc}")
             # Классические эталонные модели
@@ -405,9 +405,8 @@ def evaluate_m3_hybrids(
                 print(f"[{cat}:{sid}] Prophet failed: {exc}")
             if not forecasts:
                 naive = seasonal_naive(y_tr, H, per)
-                for model_name in base_models:
-                    label = label_map[model_name]
-                    forecasts[label] = naive.copy()
+                for model_spec in hybrid_models:
+                    forecasts[model_spec.label] = naive.copy()
             rec: Dict[str, Any] = {"category": cat, "series_id": sid}
             for col in metric_cols:
                 rec[col] = np.nan
@@ -433,22 +432,29 @@ def evaluate_m3_hybrids(
                     wavelet=wavelet,
                     level=cat_level,
                     boundary=boundary,
-                    component_forecasts=component_forecasts if component_forecasts else None,
+                    seasonal_period=per_eff,
+                    stl_kwargs=stl_kwargs,
+                    decomposition_specs=decomposition_specs_for_viz if decomposition_specs_for_viz else None,
+                    component_forecasts_by_group=component_forecasts_by_group if component_forecasts_by_group else None,
                 )
             else:
                 save_png = out_dir / f"{cat}_{sid}.png"
                 plot_forecast(title, y_tr, y_te, forecasts, save_path=save_png)
-                if component_forecasts:
-                    save_component_forecast_plot(
-                        y_tr=y_tr,
-                        y_te=y_te,
-                        component_forecasts=component_forecasts,
-                        wavelet=wavelet,
-                        level=cat_level,
-                        boundary=boundary,
-                        title=f"{title} component forecasts",
-                        save_path=out_dir / f"{cat}_{sid}_components.png",
-                    )
+                if component_forecasts_by_group:
+                    multiple_groups = len(component_forecasts_by_group) > 1
+                    for group_key, group_forecasts in component_forecasts_by_group.items():
+                        spec = decomposition_specs_for_viz.get(group_key)
+                        if spec is None:
+                            continue
+                        suffix = f"_{group_key}" if multiple_groups else ""
+                        save_component_forecast_plot(
+                            y_tr=y_tr,
+                            y_te=y_te,
+                            component_forecasts=group_forecasts,
+                            decomposition_spec=spec,
+                            title=f"{title} component forecasts",
+                            save_path=out_dir / f"{cat}_{sid}_components{suffix}.png",
+                        )
 
         if cat_rows:
             cat_df = pd.DataFrame(cat_rows)

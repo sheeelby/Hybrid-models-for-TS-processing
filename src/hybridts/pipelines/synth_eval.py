@@ -21,8 +21,8 @@ import torch
 
 from ..config.settings import settings
 from ..data import best_L, mse, mape, plot_forecast, rmse, smape, seasonal_naive
+from ..hybrids.decomposition import DecompositionSpec, decompose_series
 from ..hybrids import HybridComponent, HybridPlus, VWHybridMixed
-from ..hybrids.modwt_hybrid import modwt_decompose_with_boundary
 from ..models import DirectNeuralForecaster, arima_forecast, auto_arima_forecast, ets_forecast, make_model, prophet_forecast
 from ..training import TrainConfig
 from ..viz import (
@@ -33,39 +33,7 @@ from ..viz import (
 )
 
 from ._csv_checkpoints import append_row, reset_csv
-
-MODEL_LABELS = {
-    "timesnet": "TimesNet+",
-    "nbeats": "N-Beats+",
-    "raw_timesnet": "TimesNet (raw)",
-    "raw_nbeats": "N-Beats (raw)",
-    "vw_timesnet_ets": "VW + TimesNet + ETS",
-    "vw_timesnet_arima_auto": "VW + TimesNet + Arima_auto",
-    "vw_nbeats_ets": "VW + N-Beats + ETS",
-    "vw_nbeats_arima_auto": "VW + N-Beats + Arima_auto",
-}
-
-
-def _normalize_model_name(name: str) -> str:
-    name = str(name).strip().lower()
-    if name.startswith("raw_"):
-        return name
-    if name.endswith("_raw"):
-        base = name[: -len("_raw")]
-        return f"raw_{base}"
-    if name.startswith("direct_"):
-        base = name[len("direct_") :]
-        return f"raw_{base}"
-    return name
-
-
-def _raw_base_name(model_name: str) -> str | None:
-    model_name = _normalize_model_name(model_name)
-    if model_name.startswith("raw_"):
-        base = model_name[len("raw_") :]
-        if base in {"timesnet", "nbeats"}:
-            return base
-    return None
+from ._model_specs import ModelSpec, parse_model_spec
 
 
 @dataclass(frozen=True)
@@ -76,6 +44,7 @@ class SynthProfile:
     season_amp: float
     noise_std: float
     extra_seasons: Tuple[Tuple[int, float, float], ...] = ()
+    trend_breakpoints: Tuple[Tuple[float, float], ...] = ()
 
     def season_components(self) -> Tuple[Tuple[int, float, float], ...]:
         comps: list[Tuple[int, float, float]] = []
@@ -84,9 +53,21 @@ class SynthProfile:
         comps.extend((int(p), float(a), float(ph)) for p, a, ph in self.extra_seasons if p and p > 1 and a != 0)
         return tuple(comps)
 
+    def normalized_trend_breakpoints(self) -> Tuple[Tuple[float, float], ...]:
+        points = [
+            (float(frac), float(slope))
+            for frac, slope in self.trend_breakpoints
+            if np.isfinite(frac) and 0.0 < float(frac) < 1.0
+        ]
+        return tuple(sorted(points, key=lambda item: item[0]))
+
     @property
     def has_complex_seasonality(self) -> bool:
         return len(self.season_components()) >= 2
+
+    @property
+    def has_complex_trend(self) -> bool:
+        return len(self.normalized_trend_breakpoints()) >= 1
 
 
 def _lcm(a: int, b: int) -> int:
@@ -101,6 +82,42 @@ def _lcm_many(values: Sequence[int]) -> int | None:
     for v in vals[1:]:
         cur = _lcm(cur, v)
     return cur
+
+
+def _trend_series(length: int, profile: SynthProfile) -> np.ndarray:
+    t = np.arange(length, dtype=float)
+    if not profile.has_complex_trend:
+        return profile.trend_slope * t
+
+    points: list[Tuple[int, float]] = []
+    for frac, slope in profile.normalized_trend_breakpoints():
+        idx = int(round(frac * max(1, length - 1)))
+        idx = min(max(1, idx), max(1, length - 1))
+        if points and points[-1][0] == idx:
+            points[-1] = (idx, float(slope))
+        else:
+            points.append((idx, float(slope)))
+
+    if not points:
+        return profile.trend_slope * t
+
+    trend = np.zeros(length, dtype=float)
+    current_level = 0.0
+    current_slope = float(profile.trend_slope)
+    start = 0
+    for stop, next_slope in points:
+        seg_len = max(0, stop - start)
+        if seg_len > 0:
+            steps = np.arange(seg_len, dtype=float)
+            trend[start:stop] = current_level + current_slope * steps
+            current_level = float(trend[stop - 1] + current_slope)
+            start = stop
+        current_slope = float(next_slope)
+
+    if start < length:
+        steps = np.arange(length - start, dtype=float)
+        trend[start:] = current_level + current_slope * steps
+    return trend
 
 
 PROFILES: Dict[str, SynthProfile] = {
@@ -215,6 +232,60 @@ PROFILES: Dict[str, SynthProfile] = {
         noise_std=0.8,
         extra_seasons=((15, 1.8, 1.2),),
     ),
+    # Complex seasonality, periods with non-unit GCD (LCM = 60)
+    "complex_season_lcm60_p12_p20": SynthProfile(
+        name="complex_season_lcm60_p12_p20",
+        trend_slope=0.0,
+        season_period=12,
+        season_amp=2.0,
+        noise_std=0.7,
+        extra_seasons=((20, 1.3, 0.7),),
+    ),
+    # Complex seasonality, coprime periods (LCM = 143)
+    "complex_season_coprime_lcm143_p11_p13": SynthProfile(
+        name="complex_season_coprime_lcm143_p11_p13",
+        trend_slope=0.015,
+        season_period=11,
+        season_amp=1.5,
+        noise_std=0.9,
+        extra_seasons=((13, 1.2, 1.0),),
+    ),
+    # Complex trend, piecewise slope changes without seasonality
+    "complex_trend_piecewise_accel_plateau": SynthProfile(
+        name="complex_trend_piecewise_accel_plateau",
+        trend_slope=0.012,
+        season_period=None,
+        season_amp=0.0,
+        noise_std=0.45,
+        trend_breakpoints=((0.22, 0.055), (0.50, 0.006), (0.74, 0.03)),
+    ),
+    # Complex trend, reversal and renewed growth under higher noise
+    "complex_trend_reversal_high_noise": SynthProfile(
+        name="complex_trend_reversal_high_noise",
+        trend_slope=0.05,
+        season_period=None,
+        season_amp=0.0,
+        noise_std=1.0,
+        trend_breakpoints=((0.33, -0.015), (0.62, 0.07), (0.82, -0.035)),
+    ),
+    # Complex trend with a single seasonal component
+    "complex_trend_seasonal_level_shift": SynthProfile(
+        name="complex_trend_seasonal_level_shift",
+        trend_slope=0.018,
+        season_period=24,
+        season_amp=1.6,
+        noise_std=0.7,
+        trend_breakpoints=((0.28, 0.003), (0.52, 0.045), (0.76, -0.01)),
+    ),
+    # Complex trend that starts with decline, then recovers and stabilizes
+    "complex_trend_recovery_seasonal": SynthProfile(
+        name="complex_trend_recovery_seasonal",
+        trend_slope=-0.01,
+        season_period=36,
+        season_amp=1.4,
+        noise_std=0.85,
+        trend_breakpoints=((0.18, 0.024), (0.46, 0.06), (0.74, 0.008)),
+    ),
 }
 
 
@@ -235,8 +306,16 @@ PROFILE_GROUPS: Dict[str, Tuple[str, ...]] = {
         "seasonal_single_period_with_trend_noise",
     ),
     "complex_seasonality_examples": (
-        "complex_season_lcm36_p12_p18",
+        #"complex_season_lcm36_p12_p18",
         "complex_season_coprime_lcm105_p7_p15",
+        "complex_season_lcm60_p12_p20",
+       # "complex_season_coprime_lcm143_p11_p13",
+    ),
+    "complex_trend_examples": (
+        "complex_trend_piecewise_accel_plateau",
+        "complex_trend_reversal_high_noise",
+        "complex_trend_seasonal_level_shift",
+        "complex_trend_recovery_seasonal",
     ),
     "synth_eval_examples": (
         "nonseasonal_flat_low_noise",
@@ -272,13 +351,21 @@ def _resolve_profiles(profiles: Iterable[str] | None) -> Tuple[SynthProfile, ...
 
 
 def _describe_profile(profile: SynthProfile) -> str:
+    if profile.has_complex_trend:
+        trend_points = ", ".join(
+            [f"0.00:{profile.trend_slope:.3f}"]
+            + [f"{frac:.2f}:{slope:.3f}" for frac, slope in profile.normalized_trend_breakpoints()]
+        )
+        trend_desc = f"trend=piecewise[{trend_points}]"
+    else:
+        trend_desc = f"trend={profile.trend_slope}"
     comp_periods = [p for p, _, _ in profile.season_components()]
     if not comp_periods:
-        return f"trend={profile.trend_slope}, no seasonality, noise={profile.noise_std}"
+        return f"{trend_desc}, no seasonality, noise={profile.noise_std}"
     lcm_value = _lcm_many(comp_periods)
     complex_tag = "complex" if len(comp_periods) >= 2 else "single"
     return (
-        f"trend={profile.trend_slope}, {complex_tag} season periods={comp_periods}, "
+        f"{trend_desc}, {complex_tag} season periods={comp_periods}, "
         f"lcm={lcm_value}, noise={profile.noise_std}"
     )
 
@@ -290,7 +377,7 @@ def _generate_series(
     base_level: float = 10.0,
 ) -> np.ndarray:
     t = np.arange(length, dtype=float)
-    trend = profile.trend_slope * t
+    trend = _trend_series(length=length, profile=profile)
     season = np.zeros(length, dtype=float)
     for period, amp, phase in profile.season_components():
         season += amp * np.sin(2 * np.pi * t / period + phase)
@@ -545,6 +632,7 @@ def evaluate_synth_hybrids(
     wavelet: str = "db4",
     level: int = 1,
     boundary: str = "wrap",
+    stl_kwargs: Mapping[str, Any] | None = None,
     plot: bool = True,
     visualize: bool = False,
     use_full_modwt_components: bool = False,
@@ -558,9 +646,7 @@ def evaluate_synth_hybrids(
     hybrid_oracle_scope: str = "all",
 ) -> pd.DataFrame:
     """Run hybrid + baseline models on synthetic series."""
-    base_models = tuple((_normalize_model_name(m) for m in (base_models or ("timesnet", "nbeats"))))
-    label_map = {name: MODEL_LABELS.get(name, name.title() + "+") for name in base_models}
-    hybrid_models = base_models
+    hybrid_models = tuple(parse_model_spec(m) for m in (base_models or ("timesnet", "nbeats")))
 
     use_profiles = _resolve_profiles(profiles)
     if not use_profiles:
@@ -581,7 +667,7 @@ def evaluate_synth_hybrids(
 
     rows: List[Dict] = []
     vw_kwargs_eff = dict(vw_kwargs) if vw_kwargs else {}
-    model_order = list(dict.fromkeys([label_map[name] for name in hybrid_models] + ["ARIMA", "ARIMA_auto", "ETS", "Prophet"]))
+    model_order = list(dict.fromkeys([spec.label for spec in hybrid_models] + ["ARIMA", "ARIMA_auto", "ETS", "Prophet"]))
     metric_names = ("sMAPE", "MAPE", "RMSE", "MSE")
     metric_cols = [f"{name.replace(' ', '_')}_{metric}" for name in model_order for metric in metric_names]
     series_columns = ["profile", "series_id", *metric_cols]
@@ -610,23 +696,31 @@ def evaluate_synth_hybrids(
             y_te = y[-horizon:]
             total_len = int(y_tr.size + horizon)
 
-            comps_override: list[np.ndarray] | None = None
-            comps_full: list[np.ndarray] | None = None
-            comps_train_for_sim: list[np.ndarray] | None = None
-            if use_full_modwt_components:
-                y_full = np.concatenate([np.asarray(y_tr, float), np.asarray(y_te, float)], axis=0)
-                A_full, D_full = modwt_decompose_with_boundary(
-                    y_full, wavelet=wavelet, level=level, boundary=boundary, check=True
+            y_full = (
+                np.concatenate([np.asarray(y_tr, float), np.asarray(y_te, float)], axis=0)
+                if use_full_modwt_components
+                else None
+            )
+            train_decomp_cache: dict[tuple[Any, ...], Any] = {}
+            full_decomp_cache: dict[tuple[Any, ...], Any] = {}
+
+            def _model_decomposition_spec(model_spec: ModelSpec, seasonal_period: int | None) -> DecompositionSpec:
+                return DecompositionSpec(
+                    method=model_spec.decomposition_method or "modwt",
+                    wavelet=wavelet,
+                    level=level,
+                    boundary=boundary,
+                    seasonal_period=seasonal_period,
+                    stl_kwargs=stl_kwargs,
                 )
-                comps_full = [A_full] + D_full if len(D_full) else [A_full]
-                comps_override = [np.asarray(c[: len(y_tr)], float) for c in comps_full]
-                if simulate_full_series:
-                    comps_train_for_sim = [np.asarray(c, float).copy() for c in comps_override]
-            elif simulate_full_series:
-                A_tr_sim, D_tr_sim = modwt_decompose_with_boundary(
-                    y_tr, wavelet=wavelet, level=level, boundary=boundary, check=True
-                )
-                comps_train_for_sim = [A_tr_sim] + D_tr_sim if len(D_tr_sim) else [A_tr_sim]
+
+            def _get_decomposition(spec: DecompositionSpec, *, full: bool) -> Any:
+                cache = full_decomp_cache if full else train_decomp_cache
+                key = spec.cache_key()
+                if key not in cache:
+                    source = y_full if full and y_full is not None else y_tr
+                    cache[key] = decompose_series(source, spec=spec, check=True)
+                return cache[key]
 
             lcm_all = _lcm_many(season_periods_all) if season_periods_all else None
             lookback_per = int(lcm_all) if lcm_all and lcm_all > 1 else int(per)
@@ -642,92 +736,90 @@ def evaluate_synth_hybrids(
             )
 
             forecasts: Dict[str, np.ndarray] = {}
-            component_forecasts: Dict[str, Dict[str, np.ndarray]] = {}
+            decomposition_specs_for_viz: Dict[str, DecompositionSpec] = {}
+            component_forecasts_by_group: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
             simulations: Dict[str, np.ndarray] = {}
             # Hybrid neural models (TimesNet / N-BEATS)
-            for model_name in hybrid_models:
-                label = label_map[model_name]
+            for model_spec in hybrid_models:
+                label = model_spec.label
                 try:
                     per_eff = per if per and per > 1 else None
-                    if model_name in {"timesnet", "nbeats"}:
+                    decomp_spec: DecompositionSpec | None = None
+                    component_names: tuple[str, ...] | None = None
+                    train_components: tuple[np.ndarray, ...] | None = None
+                    comps_override: list[np.ndarray] | None = None
+                    component_map: Dict[str, np.ndarray] | None = None
+                    if model_spec.kind != "raw":
+                        decomp_spec = _model_decomposition_spec(model_spec, per_eff)
+                        dec_result = _get_decomposition(decomp_spec, full=bool(use_full_modwt_components))
+                        train_components = tuple(
+                            np.asarray(comp[: len(y_tr)] if use_full_modwt_components else comp, float)
+                            for comp in dec_result.components
+                        )
+                        comps_override = [np.asarray(comp, float) for comp in train_components]
+                        component_names = tuple(dec_result.names)
+                        decomposition_specs_for_viz[decomp_spec.group_key] = decomp_spec
+
+                    if model_spec.kind == "hybrid_all":
                         params = _effective_model_params(
-                            model_name,
+                            model_spec.name,
+                            base_model_name=model_spec.base_model_name,
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
                         model = HybridPlus(
-                            base_model_fn=_base_factory(model_name, params=params),
+                            base_model_fn=_base_factory(model_spec.base_model_name, params=params),
                             cfg=cfg,
                             wavelet=wavelet,
                             level=level,
                             boundary=boundary,
                             seasonal_period=per_eff,
+                            component_names=component_names,
                         ).fit(y_tr, components_override=comps_override)
-                    elif (raw_base := _raw_base_name(model_name)) is not None:
+                    elif model_spec.kind == "raw":
                         params = _effective_model_params(
-                            model_name,
-                            base_model_name=raw_base,
+                            model_spec.name,
+                            base_model_name=model_spec.base_model_name,
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
                         model = DirectNeuralForecaster(
-                            base_model_fn=_base_factory(raw_base, params=params),
+                            base_model_fn=_base_factory(model_spec.base_model_name, params=params),
                             cfg=cfg,
                         ).fit(y_tr)
-                    elif model_name in {"vw_timesnet_ets", "vw_timesnet_arima_auto"}:
-                        detail = "ets" if model_name.endswith("_ets") else "arima_auto"
+                    elif model_spec.kind == "hybrid_mixed":
                         aj_params = _effective_model_params(
-                            model_name,
-                            base_model_name="timesnet",
+                            model_spec.name,
+                            base_model_name=model_spec.base_model_name,
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
                         model = VWHybridMixed(
-                            aj_model_fn=_base_factory("timesnet", params=aj_params),
-                            detail_method=detail,
+                            aj_model_fn=_base_factory(model_spec.base_model_name, params=aj_params),
+                            detail_method=str(model_spec.detail_method or "ets"),
                             cfg=cfg,
                             wavelet=wavelet,
                             level=level,
                             boundary=boundary,
                             seasonal_period=per_eff,
                             seasonal_periods=season_periods_all if season_periods_all else None,
-                            **vw_kwargs_eff,
-                        ).fit(y_tr, components_override=comps_override)
-                    elif model_name in {"vw_nbeats_ets", "vw_nbeats_arima_auto"}:
-                        detail = "ets" if model_name.endswith("_ets") else "arima_auto"
-                        aj_params = _effective_model_params(
-                            model_name,
-                            base_model_name="nbeats",
-                            seasonal_period=per_eff,
-                            model_params=model_params,
-                        )
-                        model = VWHybridMixed(
-                            aj_model_fn=_base_factory("nbeats", params=aj_params),
-                            detail_method=detail,
-                            cfg=cfg,
-                            wavelet=wavelet,
-                            level=level,
-                            boundary=boundary,
-                            seasonal_period=per_eff,
-                            seasonal_periods=season_periods_all if season_periods_all else None,
+                            component_names=component_names,
                             **vw_kwargs_eff,
                         ).fit(y_tr, components_override=comps_override)
                     else:
-                        raise ValueError(f"Unknown hybrid model '{model_name}'")
+                        raise ValueError(f"Unknown hybrid model '{model_spec.name}'")
                     if isinstance(model, (HybridPlus, VWHybridMixed)):
                         forecasts[label] = model.forecast(y_tr, components_override=comps_override)
+                        component_map = model.forecast_components(y_tr, components_override=comps_override)  # type: ignore[assignment]
+                        if decomp_spec is not None:
+                            component_forecasts_by_group.setdefault(decomp_spec.group_key, {})[label] = component_map
                     else:
                         forecasts[label] = model.forecast(y_tr)
-                    if hasattr(model, "forecast_components"):
-                        if isinstance(model, (HybridPlus, VWHybridMixed)):
-                            component_forecasts[label] = model.forecast_components(y_tr, components_override=comps_override)  # type: ignore[assignment]
-                        else:
-                            component_forecasts[label] = model.forecast_components(y_tr)  # type: ignore[assignment]
 
                     if simulate_full_series:
-                        if isinstance(model, HybridPlus) and comps_train_for_sim is not None:
+                        if isinstance(model, HybridPlus) and train_components is not None:
                             fitted_components: list[np.ndarray] = []
-                            for comp_obj, comp_tr_arr in zip(model.components, comps_train_for_sim):
+                            for comp_obj, comp_tr_arr in zip(model.components, train_components):
                                 fitted_components.append(
                                     _fitted_one_step_series(
                                         comp_obj,
@@ -747,8 +839,13 @@ def evaluate_synth_hybrids(
                                 total_len=total_len,
                                 mode=simulation_mode,
                             )[:total_len]
-                        elif isinstance(model, VWHybridMixed) and comps_train_for_sim is not None and model.aj_component is not None:
-                            A_tr_arr = np.asarray(comps_train_for_sim[0], float)
+                        elif (
+                            isinstance(model, VWHybridMixed)
+                            and train_components is not None
+                            and component_names is not None
+                            and model.aj_component is not None
+                        ):
+                            A_tr_arr = np.asarray(train_components[0], float)
                             Aj_sim = _fitted_one_step_series(
                                 model.aj_component,
                                 A_tr_arr,
@@ -757,10 +854,9 @@ def evaluate_synth_hybrids(
                                 mode=simulation_mode,
                             )
                             details_sum = np.zeros(total_len, dtype=float)
-                            comp_map = component_forecasts.get(label, {})
-                            for j, dj_tr in enumerate(comps_train_for_sim[1:], start=1):
+                            for name, dj_tr in zip(component_names[1:], train_components[1:]):
                                 dj_tr = np.asarray(dj_tr, float)
-                                dj_pred = np.asarray(comp_map.get(f"D_{j}", np.zeros(horizon)), float).ravel()
+                                dj_pred = np.asarray((component_map or {}).get(name, np.zeros(horizon)), float).ravel()
                                 if dj_pred.size != horizon:
                                     dj_pred = np.pad(dj_pred, (0, max(0, horizon - dj_pred.size)), mode="edge")[:horizon]
                                 dj_series = np.concatenate([dj_tr, dj_pred], axis=0)
@@ -796,7 +892,7 @@ def evaluate_synth_hybrids(
                 _promote_hybrid_forecasts_oracle(
                     forecasts=forecasts,
                     y_true=y_te,
-                    hybrid_labels=[label_map[m] for m in hybrid_models if label_map.get(m) in forecasts],
+                    hybrid_labels=[spec.label for spec in hybrid_models if spec.label in forecasts],
                     mode=hybrid_oracle_mode,
                     metric=hybrid_oracle_metric,
                     candidate_scope=hybrid_oracle_scope,
@@ -805,9 +901,8 @@ def evaluate_synth_hybrids(
             if not forecasts:
                 # Fallback: seasonal naive or last-value persistence
                 naive = seasonal_naive(y_tr, horizon, per)
-                for model_name in hybrid_models:
-                    label = label_map[model_name]
-                    forecasts[label] = naive.copy()
+                for model_spec in hybrid_models:
+                    forecasts[model_spec.label] = naive.copy()
 
             rec: Dict[str, float | str] = {
                 "profile": profile.name,
@@ -837,7 +932,10 @@ def evaluate_synth_hybrids(
                     wavelet=wavelet,
                     level=level,
                     boundary=boundary,
-                    component_forecasts=component_forecasts if component_forecasts else None,
+                    seasonal_period=(per if per and per > 1 else None),
+                    stl_kwargs=stl_kwargs,
+                    decomposition_specs=decomposition_specs_for_viz if decomposition_specs_for_viz else None,
+                    component_forecasts_by_group=component_forecasts_by_group if component_forecasts_by_group else None,
                 )
                 if simulate_full_series and simulations:
                     if simulation_train_only_plot:
@@ -858,17 +956,21 @@ def evaluate_synth_hybrids(
             elif plot:
                 save_png = out_dir / f"{series_id}.png"
                 plot_forecast(title, y_tr, y_te, forecasts, save_path=save_png)
-                if component_forecasts:
-                    save_component_forecast_plot(
-                        y_tr=y_tr,
-                        y_te=y_te,
-                        component_forecasts=component_forecasts,
-                        wavelet=wavelet,
-                        level=level,
-                        boundary=boundary,
-                        title=f"{title} component forecasts",
-                        save_path=out_dir / f"{series_id}_components.png",
-                    )
+                if component_forecasts_by_group:
+                    multiple_groups = len(component_forecasts_by_group) > 1
+                    for group_key, group_forecasts in component_forecasts_by_group.items():
+                        spec = decomposition_specs_for_viz.get(group_key)
+                        if spec is None:
+                            continue
+                        suffix = f"_{group_key}" if multiple_groups else ""
+                        save_component_forecast_plot(
+                            y_tr=y_tr,
+                            y_te=y_te,
+                            component_forecasts=group_forecasts,
+                            decomposition_spec=spec,
+                            title=f"{title} component forecasts",
+                            save_path=out_dir / f"{series_id}_components{suffix}.png",
+                        )
                 if simulate_full_series and simulations:
                     if simulation_train_only_plot:
                         save_simulation_train_plot(

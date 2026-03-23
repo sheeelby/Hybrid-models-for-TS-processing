@@ -28,8 +28,8 @@ from ..data import (
     mse,
     rmse,
 )
+from ..hybrids.decomposition import DecompositionSpec, decompose_series
 from ..hybrids import HybridComponent, HybridPlus, VWHybridMixed, build_global_hybrid_components
-from ..hybrids.modwt_hybrid import modwt_decompose_with_boundary
 from ..models import DirectNeuralForecaster, arima_forecast, auto_arima_forecast, ets_forecast, make_model, prophet_forecast
 from ..training import TrainConfig
 from ..viz import (
@@ -41,6 +41,7 @@ from ..viz import (
 )
 
 from ._csv_checkpoints import append_row, reset_csv
+from ._model_specs import parse_model_spec
 
 
 def _fitted_one_step_series(
@@ -172,40 +173,6 @@ def _progress(iterable, **kwargs):
     return tqdm(iterable, **kwargs)
 
 
-MODEL_LABELS = {
-    "timesnet": "TimesNet+",
-    "nbeats": "N-BEATS Full",
-    "raw_timesnet": "TimesNet (raw)",
-    "raw_nbeats": "N-BEATS (raw)",
-    "vw_timesnet_ets": "VW + TimesNet + ETS",
-    "vw_timesnet_arima_auto": "VW + TimesNet + Arima_auto",
-    "vw_nbeats_ets": "VW + N-Beats + ETS",
-    "vw_nbeats_arima_auto": "VW + N-Beats + Arima_auto",
-}
-
-
-def _normalize_model_name(name: str) -> str:
-    name = str(name).strip().lower()
-    if name.startswith("raw_"):
-        return name
-    if name.endswith("_raw"):
-        base = name[: -len("_raw")]
-        return f"raw_{base}"
-    if name.startswith("direct_"):
-        base = name[len("direct_") :]
-        return f"raw_{base}"
-    return name
-
-
-def _raw_base_name(model_name: str) -> str | None:
-    model_name = _normalize_model_name(model_name)
-    if model_name.startswith("raw_"):
-        base = model_name[len("raw_") :]
-        if base in {"timesnet", "nbeats"}:
-            return base
-    return None
-
-
 def _base_factory(name: str, params: Mapping[str, Any] | None = None):
     def _fn(cfg: TrainConfig):
         return make_model(name, cfg, params=params)
@@ -261,6 +228,7 @@ def evaluate_m4_hybrids(
     wavelet: str = "db4",
     level: int = 1,
     boundary: str = "wrap",
+    stl_kwargs: Mapping[str, Any] | None = None,
     force_rebuild_csv: bool = False,
     force_rebuild_global_components: bool = False,
     series_override: Mapping[str, Sequence[str]] | None = None,
@@ -272,9 +240,7 @@ def evaluate_m4_hybrids(
     simulation_train_only_plot: bool = False,
     model_params: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    base_models = tuple((_normalize_model_name(m) for m in (base_models or ("timesnet", "nbeats"))))
-    label_map = {name: MODEL_LABELS.get(name, f"{name.title()}+") for name in base_models}
-    hybrid_models = base_models
+    hybrid_models = tuple(parse_model_spec(m) for m in (base_models or ("timesnet", "nbeats")))
 
     csv_dir = Path(csv_dir or settings.m4_csv_dir)
     out_dir = Path(out_prefix or (settings.outputs_dir / "m4_eval"))
@@ -306,7 +272,7 @@ def evaluate_m4_hybrids(
         "daily": "D",
         "hourly": "H",
     }
-    model_order = list(dict.fromkeys([label_map[name] for name in hybrid_models] + ["ARIMA", "ARIMA_auto", "ETS", "Prophet"]))
+    model_order = list(dict.fromkeys([spec.label for spec in hybrid_models] + ["ARIMA", "ARIMA_auto", "ETS", "Prophet"]))
     metric_names = ("sMAPE", "MAPE", "RMSE", "MSE")
     metric_cols = [f"{name.replace(' ', '_')}_{metric}" for name in model_order for metric in metric_names]
     series_columns = ["category", "series_id", *metric_cols]
@@ -347,26 +313,44 @@ def evaluate_m4_hybrids(
         # is disabled to keep training consistent.
         global_hybrid_components: Dict[str, List[HybridComponent]] = {}
         if not use_full_modwt_components:
-            for model_name in hybrid_models:
-                if model_name not in {"timesnet", "nbeats"}:
+            per_eff = per if per and per > 1 else None
+            for model_spec in hybrid_models:
+                if model_spec.kind != "hybrid_all":
                     continue
+                decomp_spec = DecompositionSpec(
+                    method=model_spec.decomposition_method or "modwt",
+                    wavelet=wavelet,
+                    level=cat_level,
+                    boundary=boundary,
+                    seasonal_period=per_eff,
+                    stl_kwargs=stl_kwargs,
+                )
                 params = _effective_model_params(
-                    model_name,
-                    seasonal_period=(per if per and per > 1 else None),
+                    model_spec.name,
+                    base_model_name=model_spec.base_model_name,
+                    seasonal_period=per_eff,
                     model_params=model_params,
                 )
-                hybrid_ckpt = out_dir / f"{cat}_{model_name}_hybrid_global.pt"
+                hybrid_ckpt = out_dir / f"{cat}_{model_spec.name}_hybrid_global.pt"
                 if hybrid_ckpt.exists() and not force_rebuild_global_components:
                     try:
                         ckpt = torch.load(hybrid_ckpt, map_location="cpu")
                         if "horizon" in ckpt and int(ckpt.get("horizon", -1)) != int(H):
                             raise ValueError("checkpoint params mismatch")
-                        if "wavelet" in ckpt and ckpt.get("wavelet") != wavelet:
+                        if str(ckpt.get("decomposition_method", "modwt")).lower() != decomp_spec.method:
                             raise ValueError("checkpoint params mismatch")
-                        if "level" in ckpt and int(ckpt.get("level", -1)) != int(cat_level):
-                            raise ValueError("checkpoint params mismatch")
-                        if "boundary" in ckpt and str(ckpt.get("boundary", "wrap")).lower() != str(boundary).lower():
-                            raise ValueError("checkpoint params mismatch")
+                        if decomp_spec.method == "modwt":
+                            if "wavelet" in ckpt and ckpt.get("wavelet") != wavelet:
+                                raise ValueError("checkpoint params mismatch")
+                            if "level" in ckpt and int(ckpt.get("level", -1)) != int(cat_level):
+                                raise ValueError("checkpoint params mismatch")
+                            if "boundary" in ckpt and str(ckpt.get("boundary", "wrap")).lower() != str(boundary).lower():
+                                raise ValueError("checkpoint params mismatch")
+                        else:
+                            if "seasonal_period" in ckpt and ckpt.get("seasonal_period") != per_eff:
+                                raise ValueError("checkpoint params mismatch")
+                            if "stl_kwargs" in ckpt and dict(ckpt.get("stl_kwargs", {})) != dict(stl_kwargs or {}):
+                                raise ValueError("checkpoint params mismatch")
                         comps_meta = list(ckpt.get("components", []))
                         if any(("per_series_scaling" not in item) for item in comps_meta):
                             raise ValueError("checkpoint too old (missing per_series_scaling)")
@@ -389,7 +373,7 @@ def evaluate_m4_hybrids(
                                     weight_decay=1e-4,
                                     clip=1.0,
                                 )
-                                model = _base_factory(model_name, params=params)(cfg_global)
+                                model = _base_factory(model_spec.base_model_name, params=params)(cfg_global)
                                 model.load_state_dict(state_dict)
                                 model.to(cfg_global.device)
                                 model.eval()
@@ -403,10 +387,10 @@ def evaluate_m4_hybrids(
                                 )
                             )
                         if comps:
-                            global_hybrid_components[model_name] = comps
+                            global_hybrid_components[model_spec.name] = comps
                             continue
                     except Exception as exc:
-                        print(f"[m4:{cat}] failed to load hybrid components for {model_name}: {exc}")
+                        print(f"[m4:{cat}] failed to load hybrid components for {model_spec.name}: {exc}")
 
                 hybrid_cfg = TrainConfig(
                     lookback=max(16, min(256, max(32, 2 * H, 3 * per))),
@@ -420,20 +404,24 @@ def evaluate_m4_hybrids(
                 comps = build_global_hybrid_components(
                     selected_list,
                     hybrid_cfg,
-                    base_model_fn=_base_factory(model_name, params=params),
+                    base_model_fn=_base_factory(model_spec.base_model_name, params=params),
                     wavelet=wavelet,
                     level=cat_level,
                     boundary=boundary,
+                    decompose_fn=lambda y_arr, spec=decomp_spec: decompose_series(y_arr, spec=spec, check=True).components,
                 )
-                global_hybrid_components[model_name] = comps
+                global_hybrid_components[model_spec.name] = comps
                 try:
                     payload = {
                         "category": cat,
-                        "model_name": model_name,
+                        "model_name": model_spec.name,
                         "horizon": H,
+                        "decomposition_method": decomp_spec.method,
                         "wavelet": wavelet,
                         "level": cat_level,
                         "boundary": boundary,
+                        "seasonal_period": per_eff,
+                        "stl_kwargs": dict(stl_kwargs or {}),
                         "components": [],
                     }
                     for comp in comps:
@@ -449,20 +437,16 @@ def evaluate_m4_hybrids(
                         )
                     torch.save(payload, hybrid_ckpt)
                 except Exception as exc:
-                    print(f"[m4:{cat}] failed to save hybrid components for {model_name}: {exc}")
+                    print(f"[m4:{cat}] failed to save hybrid components for {model_spec.name}: {exc}")
 
         cat_rows: List[Dict] = []
         for sid, y_tr, y_te in _progress(selected_list, desc=f"{cat} series", leave=False):
             L = best_L(y_tr, H, per)
-            comps_override: list[np.ndarray] | None = None
-            comps_full: list[np.ndarray] | None = None
-            if use_full_modwt_components:
-                y_full = np.concatenate([np.asarray(y_tr, float), np.asarray(y_te, float)], axis=0)
-                A_full, D_full = modwt_decompose_with_boundary(
-                    y_full, wavelet=wavelet, level=cat_level, boundary=boundary, check=True
-                )
-                comps_full = [A_full] + D_full if len(D_full) else [A_full]
-                comps_override = [np.asarray(c[: len(y_tr)], float) for c in comps_full]
+            y_full = (
+                np.concatenate([np.asarray(y_tr, float), np.asarray(y_te, float)], axis=0)
+                if use_full_modwt_components
+                else None
+            )
             total_len = int(len(y_tr) + H)
             cfg = TrainConfig(
                 lookback=L,
@@ -474,33 +458,66 @@ def evaluate_m4_hybrids(
                 clip=0.5,
             )
             forecasts: Dict[str, np.ndarray] = {}
-            component_forecasts: Dict[str, Dict[str, np.ndarray]] = {}
+            decomposition_specs_for_viz: Dict[str, DecompositionSpec] = {}
+            component_forecasts_by_group: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+            train_decomp_cache: dict[tuple[Any, ...], Any] = {}
+            full_decomp_cache: dict[tuple[Any, ...], Any] = {}
             simulations: Dict[str, np.ndarray] = {}
-            for model_name in hybrid_models:
-                label = label_map[model_name]
+            for model_spec in hybrid_models:
+                label = model_spec.label
                 try:
                     per_eff = per if per and per > 1 else None
-                    if model_name in {"timesnet", "nbeats"}:
+                    decomp_spec: DecompositionSpec | None = None
+                    component_names: tuple[str, ...] | None = None
+                    train_components: tuple[np.ndarray, ...] | None = None
+                    comps_override: list[np.ndarray] | None = None
+                    component_map: Dict[str, np.ndarray] | None = None
+                    if model_spec.kind != "raw":
+                        decomp_spec = DecompositionSpec(
+                            method=model_spec.decomposition_method or "modwt",
+                            wavelet=wavelet,
+                            level=cat_level,
+                            boundary=boundary,
+                            seasonal_period=per_eff,
+                            stl_kwargs=stl_kwargs,
+                        )
+                        cache = full_decomp_cache if use_full_modwt_components else train_decomp_cache
+                        key = decomp_spec.cache_key()
+                        if key not in cache:
+                            source = y_full if use_full_modwt_components and y_full is not None else y_tr
+                            cache[key] = decompose_series(source, spec=decomp_spec, check=True)
+                        dec_result = cache[key]
+                        train_components = tuple(
+                            np.asarray(comp[: len(y_tr)] if use_full_modwt_components else comp, float)
+                            for comp in dec_result.components
+                        )
+                        comps_override = [np.asarray(comp, float) for comp in train_components]
+                        component_names = tuple(dec_result.names)
+                        decomposition_specs_for_viz[decomp_spec.group_key] = decomp_spec
+
+                    if model_spec.kind == "hybrid_all":
                         params = _effective_model_params(
-                            model_name,
+                            model_spec.name,
+                            base_model_name=model_spec.base_model_name,
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
                         model = HybridPlus(
-                            base_model_fn=_base_factory(model_name, params=params),
+                            base_model_fn=_base_factory(model_spec.base_model_name, params=params),
                             cfg=cfg,
                             wavelet=wavelet,
                             level=cat_level,
                             boundary=boundary,
-                            pretrained_components=None if use_full_modwt_components else global_hybrid_components.get(model_name),
+                            pretrained_components=None if use_full_modwt_components else global_hybrid_components.get(model_spec.name),
                             seasonal_period=per_eff,
+                            component_names=component_names,
                         ).fit(y_tr, components_override=comps_override)
                         forecasts[label] = model.forecast(y_tr, components_override=comps_override)
-                        component_forecasts[label] = model.forecast_components(y_tr, components_override=comps_override)
-                        if simulate_full_series and comps_override is not None and comps_full is not None:
+                        component_map = model.forecast_components(y_tr, components_override=comps_override)
+                        component_forecasts_by_group.setdefault(decomp_spec.group_key, {})[label] = component_map
+                        if simulate_full_series and train_components is not None:
                             fitted_components = []
-                            for comp_obj, comp_full_arr in zip(model.components, comps_full):
-                                comp_tr_arr = np.asarray(comp_full_arr[: len(y_tr)], float)
+                            for comp_obj, comp_tr_arr in zip(model.components, train_components):
                                 fitted_components.append(
                                     _fitted_one_step_series(
                                         comp_obj,
@@ -513,15 +530,15 @@ def evaluate_m4_hybrids(
                             y_sim = np.sum(np.stack(fitted_components, 0), axis=0)
                             # If we simulated beyond train+H (shouldn't), trim.
                             simulations[label] = np.asarray(y_sim[:total_len], float)
-                    elif (raw_base := _raw_base_name(model_name)) is not None:
+                    elif model_spec.kind == "raw":
                         params = _effective_model_params(
-                            model_name,
-                            base_model_name=raw_base,
+                            model_spec.name,
+                            base_model_name=model_spec.base_model_name,
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
                         model = DirectNeuralForecaster(
-                            base_model_fn=_base_factory(raw_base, params=params),
+                            base_model_fn=_base_factory(model_spec.base_model_name, params=params),
                             cfg=cfg,
                         ).fit(y_tr)
                         forecasts[label] = model.forecast(y_tr)
@@ -533,27 +550,33 @@ def evaluate_m4_hybrids(
                                 total_len=total_len,
                                 mode=simulation_mode,
                             )
-                    elif model_name in {"vw_timesnet_ets", "vw_timesnet_arima_auto"}:
-                        detail = "ets" if model_name.endswith("_ets") else "arima_auto"
+                    elif model_spec.kind == "hybrid_mixed":
                         aj_params = _effective_model_params(
-                            model_name,
-                            base_model_name="timesnet",
+                            model_spec.name,
+                            base_model_name=model_spec.base_model_name,
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
                         model = VWHybridMixed(
-                            aj_model_fn=_base_factory("timesnet", params=aj_params),
-                            detail_method=detail,
+                            aj_model_fn=_base_factory(model_spec.base_model_name, params=aj_params),
+                            detail_method=str(model_spec.detail_method or "ets"),
                             cfg=cfg,
                             wavelet=wavelet,
                             level=cat_level,
                             boundary=boundary,
                             seasonal_period=per_eff,
+                            component_names=component_names,
                         ).fit(y_tr, components_override=comps_override)
                         forecasts[label] = model.forecast(y_tr, components_override=comps_override)
-                        component_forecasts[label] = model.forecast_components(y_tr, components_override=comps_override)
-                        if simulate_full_series and comps_full is not None and model.aj_component is not None:
-                            A_tr_arr = np.asarray(comps_full[0][: len(y_tr)], float)
+                        component_map = model.forecast_components(y_tr, components_override=comps_override)
+                        component_forecasts_by_group.setdefault(decomp_spec.group_key, {})[label] = component_map
+                        if (
+                            simulate_full_series
+                            and train_components is not None
+                            and component_names is not None
+                            and model.aj_component is not None
+                        ):
+                            A_tr_arr = np.asarray(train_components[0], float)
                             Aj_sim = _fitted_one_step_series(
                                 model.aj_component,
                                 A_tr_arr,
@@ -562,51 +585,9 @@ def evaluate_m4_hybrids(
                                 mode=simulation_mode,
                             )
                             details_sum = np.zeros(total_len, dtype=float)
-                            # Use true details on train, predicted details on test (H).
-                            comp_map = component_forecasts.get(label, {})
-                            for j, dj_full in enumerate(comps_full[1:], start=1):
-                                dj_tr = np.asarray(dj_full[: len(y_tr)], float)
-                                dj_pred = np.asarray(comp_map.get(f"D_{j}", np.zeros(H)), float).ravel()
-                                if dj_pred.size != H:
-                                    dj_pred = np.pad(dj_pred, (0, max(0, H - dj_pred.size)), mode="edge")[:H]
-                                dj_series = np.concatenate([dj_tr, dj_pred], axis=0)
-                                if dj_series.size < total_len:
-                                    dj_series = np.pad(dj_series, (0, total_len - dj_series.size), mode="edge")
-                                details_sum += dj_series[:total_len]
-                            simulations[label] = (Aj_sim + details_sum)[:total_len]
-                    elif model_name in {"vw_nbeats_ets", "vw_nbeats_arima_auto"}:
-                        detail = "ets" if model_name.endswith("_ets") else "arima_auto"
-                        aj_params = _effective_model_params(
-                            model_name,
-                            base_model_name="nbeats",
-                            seasonal_period=per_eff,
-                            model_params=model_params,
-                        )
-                        model = VWHybridMixed(
-                            aj_model_fn=_base_factory("nbeats", params=aj_params),
-                            detail_method=detail,
-                            cfg=cfg,
-                            wavelet=wavelet,
-                            level=cat_level,
-                            boundary=boundary,
-                            seasonal_period=per_eff,
-                        ).fit(y_tr, components_override=comps_override)
-                        forecasts[label] = model.forecast(y_tr, components_override=comps_override)
-                        component_forecasts[label] = model.forecast_components(y_tr, components_override=comps_override)
-                        if simulate_full_series and comps_full is not None and model.aj_component is not None:
-                            A_tr_arr = np.asarray(comps_full[0][: len(y_tr)], float)
-                            Aj_sim = _fitted_one_step_series(
-                                model.aj_component,
-                                A_tr_arr,
-                                device=cfg.device,
-                                total_len=total_len,
-                                mode=simulation_mode,
-                            )
-                            details_sum = np.zeros(total_len, dtype=float)
-                            comp_map = component_forecasts.get(label, {})
-                            for j, dj_full in enumerate(comps_full[1:], start=1):
-                                dj_tr = np.asarray(dj_full[: len(y_tr)], float)
-                                dj_pred = np.asarray(comp_map.get(f"D_{j}", np.zeros(H)), float).ravel()
+                            for name, dj_tr in zip(component_names[1:], train_components[1:]):
+                                dj_tr = np.asarray(dj_tr, float)
+                                dj_pred = np.asarray((component_map or {}).get(name, np.zeros(H)), float).ravel()
                                 if dj_pred.size != H:
                                     dj_pred = np.pad(dj_pred, (0, max(0, H - dj_pred.size)), mode="edge")[:H]
                                 dj_series = np.concatenate([dj_tr, dj_pred], axis=0)
@@ -615,7 +596,7 @@ def evaluate_m4_hybrids(
                                 details_sum += dj_series[:total_len]
                             simulations[label] = (Aj_sim + details_sum)[:total_len]
                     else:
-                        raise ValueError(f"Unknown hybrid model '{model_name}'")
+                        raise ValueError(f"Unknown hybrid model '{model_spec.name}'")
                 except Exception as exc:
                     print(f"[m4:{cat}:{sid}] {label} failed: {exc}")
 
@@ -640,9 +621,8 @@ def evaluate_m4_hybrids(
 
             if not forecasts:
                 naive = seasonal_naive(y_tr, H, per)
-                for model_name in base_models:
-                    label = label_map[model_name]
-                    forecasts[label] = naive.copy()
+                for model_spec in hybrid_models:
+                    forecasts[model_spec.label] = naive.copy()
 
             rec: Dict[str, Any] = {"category": cat, "series_id": sid}
             for col in metric_cols:
@@ -670,7 +650,10 @@ def evaluate_m4_hybrids(
                     wavelet=wavelet,
                     level=cat_level,
                     boundary=boundary,
-                    component_forecasts=component_forecasts if component_forecasts else None,
+                    seasonal_period=per_eff,
+                    stl_kwargs=stl_kwargs,
+                    decomposition_specs=decomposition_specs_for_viz if decomposition_specs_for_viz else None,
+                    component_forecasts_by_group=component_forecasts_by_group if component_forecasts_by_group else None,
                 )
                 if simulate_full_series and simulations:
                     if simulation_train_only_plot:
@@ -695,27 +678,29 @@ def evaluate_m4_hybrids(
                     plot_forecast_test_only(title, y_te, forecasts, save_path=save_png)
                 else:
                     plot_forecast(title, y_tr, y_te, forecasts, save_path=save_png)
-                if component_forecasts:
-                    save_component_forecast_plot(
-                        y_tr=y_tr,
-                        y_te=y_te,
-                        component_forecasts=component_forecasts,
-                        wavelet=wavelet,
-                        level=cat_level,
-                        boundary=boundary,
-                        title=f"{title} component forecasts",
-                        save_path=out_dir / f"{cat}_{sid}_components.png",
-                    )
-                    save_component_forecast_test_only_plot(
-                        y_tr=y_tr,
-                        y_te=y_te,
-                        component_forecasts=component_forecasts,
-                        wavelet=wavelet,
-                        level=cat_level,
-                        boundary=boundary,
-                        title=f"{title} component forecasts (test only)",
-                        save_path=out_dir / f"{cat}_{sid}_components_test_only.png",
-                    )
+                if component_forecasts_by_group:
+                    multiple_groups = len(component_forecasts_by_group) > 1
+                    for group_key, group_forecasts in component_forecasts_by_group.items():
+                        spec = decomposition_specs_for_viz.get(group_key)
+                        if spec is None:
+                            continue
+                        suffix = f"_{group_key}" if multiple_groups else ""
+                        save_component_forecast_plot(
+                            y_tr=y_tr,
+                            y_te=y_te,
+                            component_forecasts=group_forecasts,
+                            decomposition_spec=spec,
+                            title=f"{title} component forecasts",
+                            save_path=out_dir / f"{cat}_{sid}_components{suffix}.png",
+                        )
+                        save_component_forecast_test_only_plot(
+                            y_tr=y_tr,
+                            y_te=y_te,
+                            component_forecasts=group_forecasts,
+                            decomposition_spec=spec,
+                            title=f"{title} component forecasts (test only)",
+                            save_path=out_dir / f"{cat}_{sid}_components_test_only{suffix}.png",
+                        )
                 if simulate_full_series and simulations:
                     if simulation_train_only_plot:
                         save_simulation_train_plot(

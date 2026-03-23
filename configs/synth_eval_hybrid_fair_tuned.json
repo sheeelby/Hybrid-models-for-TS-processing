@@ -2,7 +2,7 @@
   "profiles": [
     "complex_seasonality_examples"
   ],
-  "n_per_profile": 3,
+  "n_per_profile": 1,
   "length": 840,
   "horizon": 24,
   "epochs": 24,
@@ -12,7 +12,11 @@
     "vw_timesnet_arima_auto",
     "vw_nbeats_arima_auto",
     "vw_timesnet_ets",
-    "vw_nbeats_ets"
+    "vw_nbeats_ets",
+    "stl_timesnet_arima_auto",
+    "stl_nbeats_arima_auto",
+    "stl_timesnet_ets",
+    "stl_nbeats_ets"
   ],
   "seed": 42,
   "wavelet": "db4",
@@ -26,10 +30,10 @@
   "simulation_train_only_plot": true,
   "out_prefix": "src/outputs/synth_eval_hybrid_fair_tuned",
   "vw_kwargs": {
-    "enable_output_blend": false,
-    "detail_dampen": false,
-    "detail_anchor": false,
-    "residual_anchor": false
+    "enable_output_blend": true,
+    "detail_dampen": true,
+    "detail_anchor": true,
+    "residual_anchor": true
   },
   "model_params": {
     "timesnet": {

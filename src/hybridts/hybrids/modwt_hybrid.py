@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from dataclasses import dataclass, replace
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -171,6 +171,151 @@ def _weighted_rmse(pred: np.ndarray, target: np.ndarray, weights: np.ndarray) ->
     return float(np.sqrt(max(0.0, _weighted_mse(pred, target, weights))))
 
 
+def _component_lookback(
+    base_lookback: int,
+    *,
+    horizon: int,
+    Lmax: int,
+    component_index: int,
+    n_components: int,
+) -> int:
+    base = int(min(max(1, base_lookback), max(1, Lmax)))
+    if Lmax <= 0:
+        return 0
+
+    target = base
+    if component_index == 0:
+        target = max(base, int(round(1.5 * base)), 2 * int(max(1, horizon)))
+    elif component_index == 1 and n_components > 2:
+        target = max(base, int(round(1.15 * base)))
+    return int(max(1, min(int(Lmax), int(target))))
+
+
+def _normalize_horizon_forecast(pred: np.ndarray, H: int) -> np.ndarray:
+    pred = np.asarray(pred, float).ravel()
+    if H <= 0:
+        return np.zeros(0, dtype=float)
+    if pred.size == 0:
+        return np.zeros(H, dtype=float)
+    if pred.size > H:
+        pred = pred[:H]
+    if pred.size < H:
+        pred = np.pad(pred, (0, H - pred.size), mode="edge")
+    return pred.astype(float, copy=False)
+
+
+def _baseline_forecast_raw(y_hist: np.ndarray, H: int, *, kind: str, period: int | None) -> np.ndarray:
+    y_hist = np.asarray(y_hist, float)
+    if kind == "last":
+        return _persistence_forecast(y_hist, H)
+    if kind == "arima_auto":
+        return _normalize_horizon_forecast(np.asarray(auto_arima_forecast(y_hist, H), float), H)
+    if kind == "ets":
+        sp = int(period) if period and int(period) > 1 else None
+        seasonal = "add" if sp else None
+        pred = ets_forecast(y_hist, H, seasonal_periods=sp, trend="add", seasonal=seasonal)
+        return _normalize_horizon_forecast(np.asarray(pred, float), H)
+    raise ValueError(f"Unknown raw baseline kind '{kind}'")
+
+
+def _select_output_blend(
+    hybrid_pred: np.ndarray,
+    *,
+    y_hist: np.ndarray,
+    y_tgt: np.ndarray,
+    seasonal_periods: Sequence[int] = (),
+    min_hybrid_weight: float = 0.65,
+    hard_min_hybrid_weight: float = 0.45,
+    min_improvement: float = 0.08,
+    emergency_ratio: float = 1.4,
+) -> tuple[str, float, int | None]:
+    y_hist = np.asarray(y_hist, float)
+    y_tgt = np.asarray(y_tgt, float)
+    H = int(y_tgt.size)
+    if H <= 0 or y_hist.size < 8:
+        return ("none", 1.0, None)
+
+    hyb = _normalize_horizon_forecast(np.asarray(hybrid_pred, float), H)
+    tau = max(1.5, float(min(H, 8)) / 2.0)
+    w = np.exp(-np.arange(H, dtype=float) / tau)
+    w = w / (np.mean(w) + 1e-12)
+    hybrid_score = _weighted_rmse(hyb, y_tgt, w)
+
+    candidate_baselines: list[tuple[str, int | None]] = [("last", None), ("arima_auto", None), ("ets", None)]
+    for p in sorted({int(p) for p in seasonal_periods if p is not None and int(p) > 1}):
+        if y_hist.size >= 2 * int(p):
+            candidate_baselines.append(("ets", int(p)))
+
+    best = (hybrid_score, "none", 1.0, None, hybrid_score)
+    for kind, period in candidate_baselines:
+        try:
+            base = _baseline_forecast_raw(y_hist, H, kind=kind, period=period)
+        except Exception:
+            continue
+        base_score = _weighted_rmse(base, y_tgt, w)
+
+        d = hyb - base
+        n = y_tgt - base
+        denom = float(np.sum(w * d * d))
+        if denom <= 1e-12:
+            alpha_opt = 1.0
+        else:
+            alpha_opt = float(np.clip(np.sum(w * d * n) / denom, 0.0, 1.0))
+        for alpha in (alpha_opt, 0.0, 0.25, 0.5, 0.75, 1.0):
+            pred = alpha * hyb + (1.0 - alpha) * base
+            score = _weighted_rmse(pred, y_tgt, w)
+            if score + 1e-12 < best[0]:
+                best = (score, kind, float(alpha), period, base_score)
+
+    best_score, kind_best, alpha_best, period_best, base_score_best = best
+    if kind_best == "none":
+        return ("none", 1.0, None)
+
+    rel_improvement = float((hybrid_score - best_score) / max(hybrid_score, 1e-12))
+    if rel_improvement < float(max(0.0, min_improvement)):
+        return ("none", 1.0, None)
+
+    alpha_best = float(np.clip(alpha_best, 0.0, 1.0))
+    min_hybrid_weight = float(np.clip(min_hybrid_weight, 0.0, 1.0))
+    hard_min_hybrid_weight = float(np.clip(hard_min_hybrid_weight, 0.0, min_hybrid_weight))
+    emergency_ratio = float(max(1.0, emergency_ratio))
+
+    if alpha_best < min_hybrid_weight:
+        allow_hard_fallback = (
+            np.isfinite(base_score_best)
+            and hybrid_score > float(base_score_best) * emergency_ratio
+            and rel_improvement >= max(2.0 * float(min_improvement), 0.12)
+        )
+        if not allow_hard_fallback:
+            try:
+                base = _baseline_forecast_raw(y_hist, H, kind=str(kind_best), period=period_best)
+            except Exception:
+                return ("none", 1.0, None)
+            alpha_floor = min_hybrid_weight
+            pred_floor = alpha_floor * hyb + (1.0 - alpha_floor) * base
+            score_floor = _weighted_rmse(pred_floor, y_tgt, w)
+            gain_floor = float((hybrid_score - score_floor) / max(hybrid_score, 1e-12))
+            if gain_floor < max(0.5 * float(min_improvement), 0.03):
+                return ("none", 1.0, None)
+            alpha_best = alpha_floor
+        else:
+            try:
+                base = _baseline_forecast_raw(y_hist, H, kind=str(kind_best), period=period_best)
+            except Exception:
+                return ("none", 1.0, None)
+            alpha_floor = max(hard_min_hybrid_weight, alpha_best)
+            pred_floor = alpha_floor * hyb + (1.0 - alpha_floor) * base
+            score_floor = _weighted_rmse(pred_floor, y_tgt, w)
+            gain_floor = float((hybrid_score - score_floor) / max(hybrid_score, 1e-12))
+            if gain_floor < max(0.5 * float(min_improvement), 0.03):
+                return ("none", 1.0, None)
+            alpha_best = alpha_floor
+
+    if alpha_best >= 0.999:
+        return ("none", 1.0, None)
+    return (str(kind_best), float(alpha_best), int(period_best) if period_best else None)
+
+
 def _acf_lag_score(x: np.ndarray, lag: int) -> float:
     x = np.asarray(x, float)
     lag = int(lag)
@@ -198,6 +343,9 @@ def _calibrate_blend_weight(
     horizon: int,
     device: str,
     max_eval_windows: int = 8,
+    min_model_weight: float = 0.55,
+    min_improvement: float = 0.03,
+    emergency_ratio: float = 1.4,
 ) -> float:
     comp = np.asarray(comp, float)
     if (
@@ -256,13 +404,20 @@ def _calibrate_blend_weight(
     mse_model = _weighted_mse(P, T, W)
     mse_base = _weighted_mse(B, T, W)
     mse_blend = _weighted_mse(B + w_opt * d, T, W)
-
-    # Only shrink if it improves enough to matter and avoid noise-sensitive flips.
-    if mse_blend <= min(mse_model, mse_base) * 0.995:
-        return w_opt
-    if mse_model <= mse_base * 1.02:
+    rel_improvement = float((mse_model - mse_blend) / max(mse_model, 1e-12))
+    if mse_model <= mse_base * 1.05:
         return 1.0
-    return min(1.0, max(0.0, w_opt))
+    if rel_improvement < float(max(0.0, min_improvement)):
+        return 1.0
+
+    w_eff = float(np.clip(w_opt, 0.0, 1.0))
+    if mse_model <= mse_base * float(max(1.0, emergency_ratio)):
+        w_eff = max(float(np.clip(min_model_weight, 0.0, 1.0)), w_eff)
+        mse_eff = _weighted_mse(B + w_eff * d, T, W)
+        eff_improvement = float((mse_model - mse_eff) / max(mse_model, 1e-12))
+        if eff_improvement < max(0.5 * float(min_improvement), 0.01):
+            return 1.0
+    return float(np.clip(w_eff, 0.0, 1.0))
 
 
 def build_global_hybrid_components(
@@ -272,20 +427,31 @@ def build_global_hybrid_components(
     wavelet: str = "db4",
     level: int = 1,
     boundary: str = "wrap",
+    decompose_fn: Callable[[np.ndarray], Sequence[np.ndarray]] | None = None,
 ) -> List[HybridComponent]:
 
     if not pairs:
         return []
 
     comp_values: List[List[np.ndarray]] = []
+    if decompose_fn is None:
+        def decompose_fn(y_arr: np.ndarray) -> Sequence[np.ndarray]:
+            A_loc, D_loc = modwt_decompose_with_boundary(
+                y_arr,
+                wavelet=wavelet,
+                level=level,
+                boundary=boundary,
+                check=True,
+            )
+            return [A_loc] + D_loc if len(D_loc) else [A_loc]
+
     for _, y_tr, _ in pairs:
         y = np.asarray(y_tr, float)
         if y.size < 2:
             continue
-        A, D = modwt_decompose_with_boundary(
-            y, wavelet=wavelet, level=level, boundary=boundary, check=True
-        )
-        comps = [A] + D if len(D) else [A]
+        comps = [np.asarray(comp, float) for comp in decompose_fn(y)]
+        if not comps:
+            comps = [y]
         if not comp_values:
             comp_values = [[] for _ in range(len(comps))]
         for idx, comp in enumerate(comps):
@@ -295,11 +461,23 @@ def build_global_hybrid_components(
 
     components: List[HybridComponent] = []
     H = cfg.horizon
-    L = cfg.lookback
-    for comp_series in comp_values:
+    base_L = int(cfg.lookback)
+    n_components = len(comp_values)
+    for comp_idx, comp_series in enumerate(comp_values):
         if not comp_series:
             components.append(HybridComponent(None, 0.0, 1.0, None, per_series_scaling=True))
             continue
+        Lmax_series = min((len(arr) - H for arr in comp_series), default=0)
+        if Lmax_series <= 0:
+            components.append(HybridComponent(None, 0.0, 1.0, None, per_series_scaling=True))
+            continue
+        L = _component_lookback(
+            base_L,
+            horizon=H,
+            Lmax=int(Lmax_series),
+            component_index=comp_idx,
+            n_components=n_components,
+        )
         X_list: List[np.ndarray] = []
         Y_list: List[np.ndarray] = []
         for arr in comp_series:
@@ -321,8 +499,9 @@ def build_global_hybrid_components(
             torch.from_numpy(X).unsqueeze(1),
             torch.from_numpy(Y),
         )
-        model = base_model_fn(cfg)
-        trained = train_model(model, ds, cfg)
+        cfg_local = replace(cfg, lookback=int(L))
+        model = base_model_fn(cfg_local)
+        trained = train_model(model, ds, cfg_local)
         components.append(HybridComponent(trained, 0.0, 1.0, L, per_series_scaling=True))
     return components
 
@@ -337,6 +516,15 @@ class HybridPlus:
         boundary: str = "wrap",
         pretrained_components: Optional[List[HybridComponent]] = None,
         seasonal_period: int | None = None,
+        component_names: Sequence[str] | None = None,
+        enable_output_blend: bool = True,
+        output_blend_min_alpha: float = 0.65,
+        output_blend_hard_min_alpha: float = 0.45,
+        output_blend_min_improvement: float = 0.08,
+        output_blend_emergency_ratio: float = 1.4,
+        component_blend_min_weight: float = 0.55,
+        component_blend_min_improvement: float = 0.03,
+        component_blend_emergency_ratio: float = 1.4,
     ):
         self.base_model_fn = base_model_fn
         self.cfg = cfg
@@ -346,28 +534,96 @@ class HybridPlus:
         self.components: List[HybridComponent] = []
         self.pretrained_components = pretrained_components
         self.seasonal_period = int(seasonal_period) if seasonal_period is not None else None
+        self.component_names = tuple(component_names) if component_names is not None else None
+        self.enable_output_blend = bool(enable_output_blend)
+        self.output_blend_min_alpha = float(output_blend_min_alpha)
+        self.output_blend_hard_min_alpha = float(output_blend_hard_min_alpha)
+        self.output_blend_min_improvement = float(output_blend_min_improvement)
+        self.output_blend_emergency_ratio = float(output_blend_emergency_ratio)
+        self.component_blend_min_weight = float(component_blend_min_weight)
+        self.component_blend_min_improvement = float(component_blend_min_improvement)
+        self.component_blend_emergency_ratio = float(component_blend_emergency_ratio)
+        self.component_names_: tuple[str, ...] = ()
+        self.output_blend_kind: str = "none"
+        self.output_blend_alpha: float = 1.0
+        self.output_blend_period: int | None = None
 
-    def _prepare_component(self, comp: np.ndarray) -> HybridComponent:
+    def _resolve_component_names(self, n_components: int) -> tuple[str, ...]:
+        if self.component_names is not None:
+            if len(self.component_names) != n_components:
+                raise ValueError(
+                    f"component_names length mismatch: got {len(self.component_names)}, expected {n_components}"
+                )
+            return tuple(self.component_names)
+        if n_components <= 0:
+            return ()
+        return tuple(["A_J"] + [f"D_{j}" for j in range(1, n_components)])
+
+    def _prepare_component(self, comp: np.ndarray, *, component_index: int, n_components: int) -> HybridComponent:
         Lmax = len(comp) - self.cfg.horizon
         min_windows = 8
         if Lmax <= 0:
             return HybridComponent(None, float(comp.mean()), float(comp.std() + 1e-8), None, per_series_scaling=False)
-        L = int(min(self.cfg.lookback, max(1, Lmax)))
+        L = _component_lookback(
+            int(self.cfg.lookback),
+            horizon=int(self.cfg.horizon),
+            Lmax=int(Lmax),
+            component_index=component_index,
+            n_components=n_components,
+        )
         ds = WindowDatasetStd(comp, L, self.cfg.horizon, stride=1, scale=True)
         if len(ds) < min_windows:
             mu, sd = ds.scaler
             return HybridComponent(None, float(mu), float(sd), None, per_series_scaling=False)
         mu, sd = ds.scaler
-        model = self.base_model_fn(self.cfg)
-        trained = train_model(model, ds, self.cfg)
+        cfg_local = replace(self.cfg, lookback=int(L))
+        model = self.base_model_fn(cfg_local)
+        trained = train_model(model, ds, cfg_local)
         component = HybridComponent(trained, mu, sd, L, per_series_scaling=False)
         component.blend_weight = _calibrate_blend_weight(
             component,
             np.asarray(comp, float),
             horizon=self.cfg.horizon,
             device=self.cfg.device,
+            min_model_weight=self.component_blend_min_weight,
+            min_improvement=self.component_blend_min_improvement,
+            emergency_ratio=self.component_blend_emergency_ratio,
         )
         return component
+
+    def _calibrate_output_blend(self, y: np.ndarray) -> None:
+        y = np.asarray(y, float)
+        H = int(self.cfg.horizon)
+        self.output_blend_kind = "none"
+        self.output_blend_alpha = 1.0
+        self.output_blend_period = None
+        if H <= 0 or y.size < (3 * H + 8):
+            return
+
+        y_hist = y[:-H]
+        y_tgt = y[-H:]
+        if y_hist.size < 8:
+            return
+
+        try:
+            hyb = np.asarray(self.forecast(y_hist), float)
+        except Exception:
+            return
+
+        seasonal_periods = ((self.seasonal_period,) if self.seasonal_period and self.seasonal_period > 1 else ())
+        kind_best, alpha_best, period_best = _select_output_blend(
+            hyb,
+            y_hist=y_hist,
+            y_tgt=y_tgt,
+            seasonal_periods=seasonal_periods,
+            min_hybrid_weight=self.output_blend_min_alpha,
+            hard_min_hybrid_weight=self.output_blend_hard_min_alpha,
+            min_improvement=self.output_blend_min_improvement,
+            emergency_ratio=self.output_blend_emergency_ratio,
+        )
+        self.output_blend_kind = str(kind_best)
+        self.output_blend_alpha = float(alpha_best)
+        self.output_blend_period = int(period_best) if period_best else None
 
     def fit(self, y, *, components_override: Optional[List[np.ndarray]] = None):
         y = np.asarray(y, float)
@@ -380,11 +636,21 @@ class HybridPlus:
             comps = [np.asarray(c, float) for c in components_override]
             if not comps:
                 comps = [y]
+        self.component_names_ = self._resolve_component_names(len(comps))
         if self.pretrained_components is not None and len(self.pretrained_components) == len(comps):
             # Reuse globally trained components; no per-series training.
             self.components = self.pretrained_components
         else:
-            self.components = [self._prepare_component(comp) for comp in comps]
+            self.components = [
+                self._prepare_component(comp, component_index=idx, n_components=len(comps))
+                for idx, comp in enumerate(comps)
+            ]
+        if self.enable_output_blend:
+            self._calibrate_output_blend(y)
+        else:
+            self.output_blend_kind = "none"
+            self.output_blend_alpha = 1.0
+            self.output_blend_period = None
         return self
 
     def forecast(self, y, *, components_override: Optional[List[np.ndarray]] = None):
@@ -430,7 +696,24 @@ class HybridPlus:
             yhat = yhat[:H]
         if yhat.size < H:
             yhat = np.pad(yhat, (0, H - yhat.size), mode="edge")
-        return _stabilize_reconstruction_boundary(y, yhat)
+        yhat = _stabilize_reconstruction_boundary(y, yhat)
+
+        if self.enable_output_blend and self.output_blend_kind != "none" and self.output_blend_alpha < 0.999:
+            try:
+                base = _baseline_forecast_raw(
+                    np.asarray(y, float),
+                    H,
+                    kind=self.output_blend_kind,
+                    period=self.output_blend_period,
+                )
+                yhat = (
+                    float(self.output_blend_alpha) * np.asarray(yhat, float)
+                    + (1.0 - float(self.output_blend_alpha)) * np.asarray(base, float)
+                )
+                yhat = _stabilize_reconstruction_boundary(y, np.asarray(yhat, float))
+            except Exception:
+                pass
+        return np.asarray(yhat, float)
 
     def forecast_components(self, y, *, components_override: Optional[List[np.ndarray]] = None) -> dict[str, np.ndarray]:
         """Return per-component forecasts used for reconstruction.
@@ -450,7 +733,8 @@ class HybridPlus:
                 comps = [y]
             A = comps[0]
         if not self.components:
-            return {"A_J": np.repeat(float(A[-1]) if A.size else 0.0, H).astype(float)}
+            names = self.component_names_ or self._resolve_component_names(len(comps))
+            return {names[0]: np.repeat(float(A[-1]) if A.size else 0.0, H).astype(float)}
 
         comp_preds: List[np.ndarray] = []
         for component, comp in zip(self.components, comps):
@@ -484,9 +768,10 @@ class HybridPlus:
                     details[j] = details[j] + diff * (weights[j] / (denom + 1e-8))
             comp_preds = [comp_preds[0]] + details
 
-        out: dict[str, np.ndarray] = {"A_J": np.asarray(comp_preds[0], float)}
-        for j, pred in enumerate(comp_preds[1:], start=1):
-            out[f"D_{j}"] = np.asarray(pred, float)
+        names = self.component_names_ or self._resolve_component_names(len(comp_preds))
+        out: dict[str, np.ndarray] = {names[0]: np.asarray(comp_preds[0], float)}
+        for name, pred in zip(names[1:], comp_preds[1:]):
+            out[name] = np.asarray(pred, float)
         return out
 
 
@@ -509,6 +794,14 @@ class VWHybridMixed:
         residual_anchor: bool = True,
         residual_transition_steps: int = 6,
         enable_output_blend: bool = True,
+        component_names: Sequence[str] | None = None,
+        output_blend_min_alpha: float = 0.65,
+        output_blend_hard_min_alpha: float = 0.45,
+        output_blend_min_improvement: float = 0.08,
+        output_blend_emergency_ratio: float = 1.4,
+        component_blend_min_weight: float = 0.55,
+        component_blend_min_improvement: float = 0.03,
+        component_blend_emergency_ratio: float = 1.4,
     ) -> None:
         self.aj_model_fn = aj_model_fn
         self.detail_method = str(detail_method).lower()
@@ -534,6 +827,15 @@ class VWHybridMixed:
         self.residual_anchor = bool(residual_anchor)
         self.residual_transition_steps = int(residual_transition_steps)
         self.enable_output_blend = bool(enable_output_blend)
+        self.component_names = tuple(component_names) if component_names is not None else None
+        self.output_blend_min_alpha = float(output_blend_min_alpha)
+        self.output_blend_hard_min_alpha = float(output_blend_hard_min_alpha)
+        self.output_blend_min_improvement = float(output_blend_min_improvement)
+        self.output_blend_emergency_ratio = float(output_blend_emergency_ratio)
+        self.component_blend_min_weight = float(component_blend_min_weight)
+        self.component_blend_min_improvement = float(component_blend_min_improvement)
+        self.component_blend_emergency_ratio = float(component_blend_emergency_ratio)
+        self.component_names_: tuple[str, ...] = ()
         self.aj_component: HybridComponent | None = None
         self.detail_policies: list[VWDetailPolicy] = []
         self.detail_residual_scale: float = 1.0
@@ -541,25 +843,46 @@ class VWHybridMixed:
         self.output_blend_alpha: float = 1.0  # weight of hybrid forecast
         self.output_blend_period: int | None = None
 
+    def _resolve_component_names(self, n_components: int) -> tuple[str, ...]:
+        if self.component_names is not None:
+            if len(self.component_names) != n_components:
+                raise ValueError(
+                    f"component_names length mismatch: got {len(self.component_names)}, expected {n_components}"
+                )
+            return tuple(self.component_names)
+        if n_components <= 0:
+            return ()
+        return tuple(["A_J"] + [f"D_{j}" for j in range(1, n_components)])
+
     def _prepare_component(self, comp: np.ndarray) -> HybridComponent:
         Lmax = len(comp) - self.cfg.horizon
         min_windows = 8
         if Lmax <= 0:
             return HybridComponent(None, float(comp.mean()), float(comp.std() + 1e-8), None)
-        L = int(min(self.cfg.lookback, max(1, Lmax)))
+        L = _component_lookback(
+            int(self.cfg.lookback),
+            horizon=int(self.cfg.horizon),
+            Lmax=int(Lmax),
+            component_index=0,
+            n_components=1,
+        )
         ds = WindowDatasetStd(comp, L, self.cfg.horizon, stride=1, scale=True)
         if len(ds) < min_windows:
             mu, sd = ds.scaler
             return HybridComponent(None, float(mu), float(sd), None)
         mu, sd = ds.scaler
-        model = self.aj_model_fn(self.cfg)
-        trained = train_model(model, ds, self.cfg)
+        cfg_local = replace(self.cfg, lookback=int(L))
+        model = self.aj_model_fn(cfg_local)
+        trained = train_model(model, ds, cfg_local)
         component = HybridComponent(trained, mu, sd, L)
         component.blend_weight = _calibrate_blend_weight(
             component,
             np.asarray(comp, float),
             horizon=self.cfg.horizon,
             device=self.cfg.device,
+            min_model_weight=self.component_blend_min_weight,
+            min_improvement=self.component_blend_min_improvement,
+            emergency_ratio=self.component_blend_emergency_ratio,
         )
         return component
 
@@ -710,16 +1033,7 @@ class VWHybridMixed:
         self.detail_residual_scale = scale
 
     def _baseline_forecast_raw(self, y_hist: np.ndarray, H: int, *, kind: str, period: int | None) -> np.ndarray:
-        y_hist = np.asarray(y_hist, float)
-        if kind == "last":
-            return _persistence_forecast(y_hist, H)
-        if kind == "arima_auto":
-            return np.asarray(auto_arima_forecast(y_hist, H), float)
-        if kind == "ets":
-            sp = int(period) if period and int(period) > 1 else None
-            seasonal = "add" if sp else None
-            return np.asarray(ets_forecast(y_hist, H, seasonal_periods=sp, trend="add", seasonal=seasonal), float)
-        raise ValueError(f"Unknown raw baseline kind '{kind}'")
+        return _baseline_forecast_raw(y_hist, H, kind=kind, period=period)
 
     def _calibrate_output_blend(self, y: np.ndarray) -> None:
         y = np.asarray(y, float)
@@ -739,47 +1053,17 @@ class VWHybridMixed:
             hyb = np.asarray(self.forecast(y_hist), float)
         except Exception:
             return
-        if hyb.size != H:
-            if hyb.size > H:
-                hyb = hyb[:H]
-            else:
-                hyb = np.pad(hyb, (0, H - hyb.size), mode="edge")
 
-        tau = max(1.5, float(min(H, 8)) / 2.0)
-        w = np.exp(-np.arange(H, dtype=float) / tau)
-        w = w / (np.mean(w) + 1e-12)
-
-        candidate_baselines: list[tuple[str, int | None]] = [("last", None), ("arima_auto", None), ("ets", None)]
-        for p in self.seasonal_periods:
-            if y_hist.size >= 2 * int(p):
-                candidate_baselines.append(("ets", int(p)))
-
-        best = (_weighted_rmse(hyb, y_tgt, w), "none", 1.0, None)
-        for kind, period in candidate_baselines:
-            try:
-                base = self._baseline_forecast_raw(y_hist, H, kind=kind, period=period)
-            except Exception:
-                continue
-            if base.size != H:
-                if base.size > H:
-                    base = base[:H]
-                else:
-                    base = np.pad(base, (0, H - base.size), mode="edge")
-
-            d = hyb - base
-            n = y_tgt - base
-            denom = float(np.sum(w * d * d))
-            if denom <= 1e-12:
-                alpha_opt = 1.0
-            else:
-                alpha_opt = float(np.clip(np.sum(w * d * n) / denom, 0.0, 1.0))
-            for alpha in (alpha_opt, 0.0, 0.25, 0.5, 0.75, 1.0):
-                pred = alpha * hyb + (1.0 - alpha) * base
-                score = _weighted_rmse(pred, y_tgt, w)
-                if score + 1e-12 < best[0]:
-                    best = (score, kind, float(alpha), period)
-
-        _, kind_best, alpha_best, period_best = best
+        kind_best, alpha_best, period_best = _select_output_blend(
+            hyb,
+            y_hist=y_hist,
+            y_tgt=y_tgt,
+            seasonal_periods=self.seasonal_periods,
+            min_hybrid_weight=self.output_blend_min_alpha,
+            hard_min_hybrid_weight=self.output_blend_hard_min_alpha,
+            min_improvement=self.output_blend_min_improvement,
+            emergency_ratio=self.output_blend_emergency_ratio,
+        )
         self.output_blend_kind = str(kind_best)
         self.output_blend_alpha = float(alpha_best)
         self.output_blend_period = int(period_best) if period_best else None
@@ -794,6 +1078,7 @@ class VWHybridMixed:
             comps = [np.asarray(c, float) for c in components_override]
             A = comps[0] if comps else y
             D = comps[1:] if len(comps) > 1 else []
+        self.component_names_ = self._resolve_component_names(1 + len(D))
         self._fit_detail_policies(D)
         self._calibrate_detail_residual_scale(D)
         self.aj_component = self._prepare_component(A)
@@ -981,9 +1266,10 @@ class VWHybridMixed:
         else:
             details = []
 
-        out: dict[str, np.ndarray] = {"A_J": np.asarray(aj_pred, float)}
-        for j, pred in enumerate(details, start=1):
-            out[f"D_{j}"] = np.asarray(pred, float)
+        names = self.component_names_ or self._resolve_component_names(1 + len(details))
+        out: dict[str, np.ndarray] = {names[0]: np.asarray(aj_pred, float)}
+        for name, pred in zip(names[1:], details):
+            out[name] = np.asarray(pred, float)
         return out
 
 

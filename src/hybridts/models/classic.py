@@ -2,14 +2,15 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from typing import Iterable, Tuple
+import warnings
 
 import numpy as np
 
 try:
     from statsmodels.tsa.arima.model import ARIMA
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
-except Exception:  
-    ARIMA = None 
+except Exception:
+    ARIMA = None
     ExponentialSmoothing = None
 
 try:
@@ -31,6 +32,7 @@ except Exception:
     Prophet = None
     _disable_cmdstanpy_logging = None
 
+
 def _repeat_last(y: np.ndarray, horizon: int) -> np.ndarray:
     if horizon <= 0:
         raise ValueError("horizon must be positive")
@@ -49,12 +51,39 @@ def _clean_series(y: Iterable[float]) -> np.ndarray:
     return data.astype(float, copy=False)
 
 
+def _tail_diff_std(data: np.ndarray, window: int = 16) -> float:
+    data = np.asarray(data, float).ravel()
+    if data.size < 3:
+        return 0.0
+    tail = data[-min(int(window), int(data.size)) :]
+    diffs = np.diff(tail)
+    if diffs.size == 0:
+        return 0.0
+    return float(np.nanstd(diffs))
+
+
+def _seasonal_naive(data: np.ndarray, horizon: int, seasonal_periods: int) -> np.ndarray:
+    data = np.asarray(data, float).ravel()
+    per = int(seasonal_periods)
+    if per <= 1 or data.size == 0:
+        return _repeat_last(data, horizon)
+    base = data[-per:]
+    reps = int(np.ceil(horizon / per))
+    tiled = np.tile(base, reps)
+    out = np.asarray(tiled[:horizon], float).ravel()
+    if out.size != horizon:
+        out = np.resize(out, horizon)
+    return out.astype(float, copy=False)
+
+
 def _linear_extrapolation(y: np.ndarray, horizon: int, window: int = 32) -> np.ndarray:
     if horizon <= 0:
         raise ValueError("horizon must be positive")
     if y.size == 0:
         return np.zeros(horizon, dtype=float)
     n = int(y.size)
+    if n < 2:
+        return _repeat_last(y, horizon)
     w = int(min(max(2, window), n))
     t = np.arange(w, dtype=float)
     y_w = y[-w:].astype(float, copy=False)
@@ -65,13 +94,19 @@ def _linear_extrapolation(y: np.ndarray, horizon: int, window: int = 32) -> np.n
     return (slope * future_t + intercept + y_mean).astype(float)
 
 
+def _baseline_fallback(data: np.ndarray, horizon: int, *, seasonal_periods: int | None = None) -> np.ndarray:
+    if seasonal_periods and int(seasonal_periods) > 1 and int(data.size) >= int(seasonal_periods):
+        return _seasonal_naive(data, horizon, int(seasonal_periods))
+    return _linear_extrapolation(data, horizon)
+
+
 def _arima_trend_for_d(d: int) -> str:
     return "t" if int(d) > 0 else "c"
 
 
 def _fit_forecast_arima(data: np.ndarray, horizon: int, order: Tuple[int, int, int]) -> np.ndarray:
     if ARIMA is None:
-        raise RuntimeError("statsmodels не установлен, ARIMA недоступна")
+        raise RuntimeError("statsmodels РЅРµ СѓСЃС‚Р°РЅРѕРІР»РµРЅ, ARIMA РЅРµРґРѕСЃС‚СѓРїРЅР°")
     p, d, q = (int(order[0]), int(order[1]), int(order[2]))
     trend = _arima_trend_for_d(d)
     model = ARIMA(
@@ -116,10 +151,9 @@ def arima_forecast(
     horizon: int,
     order: Tuple[int, int, int] = (1, 1, 1),
 ) -> np.ndarray:
-
     if ARIMA is None:
-        raise RuntimeError("statsmodels не установлен, ARIMA недоступна")
-    
+        raise RuntimeError("statsmodels РЅРµ СѓСЃС‚Р°РЅРѕРІР»РµРЅ, ARIMA РЅРµРґРѕСЃС‚СѓРїРЅР°")
+
     data = _clean_series(y)
     if data.size < 6:
         return _linear_extrapolation(data, horizon)
@@ -145,24 +179,39 @@ def ets_forecast(
     seasonal: str | None = "add",
 ) -> np.ndarray:
     if ExponentialSmoothing is None:
-        raise RuntimeError("statsmodels не установлен, ETS недоступна")
-    data = np.asarray(list(y), dtype=float)
+        raise RuntimeError("statsmodels РЅРµ СѓСЃС‚Р°РЅРѕРІР»РµРЅ, ETS РЅРµРґРѕСЃС‚СѓРїРЅР°")
+    data = _clean_series(y)
+    sp = seasonal_periods if seasonal_periods and int(seasonal_periods) > 1 else None
     if data.size < 4:
-        return _repeat_last(data, horizon)
-    seasonal_periods = seasonal_periods if seasonal_periods and seasonal_periods > 1 else None
-    seasonal = seasonal if seasonal_periods else None
+        return _baseline_fallback(data, horizon, seasonal_periods=sp)
+    seasonal = seasonal if sp else None
     try:
         model = ExponentialSmoothing(
             data,
             trend=trend,
             seasonal=seasonal,
-            seasonal_periods=seasonal_periods,
+            seasonal_periods=sp,
         )
-        fitted = model.fit(optimized=True, use_brute=True)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"divide by zero encountered in log",
+                category=RuntimeWarning,
+            )
+            fitted = model.fit(optimized=True, use_brute=True)
         forecast = fitted.forecast(horizon)
-        return np.asarray(forecast, dtype=float)
+        out = np.asarray(forecast, dtype=float).ravel()
+        if out.size != horizon:
+            if out.size < horizon:
+                out = np.pad(out, (0, horizon - out.size), mode="edge")
+            out = out[:horizon]
+        if not np.all(np.isfinite(out)):
+            return _baseline_fallback(data, horizon, seasonal_periods=sp)
+        if np.nanstd(out) < 1e-12 and _tail_diff_std(data) > 1e-12:
+            return _baseline_fallback(data, horizon, seasonal_periods=sp)
+        return out.astype(float, copy=False)
     except Exception:
-        return _repeat_last(data, horizon)
+        return _baseline_fallback(data, horizon, seasonal_periods=sp)
 
 
 def auto_arima_forecast(
@@ -170,7 +219,7 @@ def auto_arima_forecast(
     horizon: int,
 ) -> np.ndarray:
     if ARIMA is None:
-        raise RuntimeError("statsmodels не установлен, ARIMA недоступна")
+        raise RuntimeError("statsmodels РЅРµ СѓСЃС‚Р°РЅРѕРІР»РµРЅ, ARIMA РЅРµРґРѕСЃС‚СѓРїРЅР°")
     data = _clean_series(y)
     if data.size < 6:
         return _linear_extrapolation(data, horizon)
@@ -217,10 +266,10 @@ def prophet_forecast(
     freq: str = "D",
 ) -> np.ndarray:
     if Prophet is None or pd is None:
-        raise RuntimeError("prophet не установлен, Prophet недоступен")
-    data = np.asarray(list(y), dtype=float)
+        raise RuntimeError("prophet РЅРµ СѓСЃС‚Р°РЅРѕРІР»РµРЅ, Prophet РЅРµРґРѕСЃС‚СѓРїРµРЅ")
+    data = _clean_series(y)
     if data.size < 2:
-        return _repeat_last(data, horizon)
+        return _baseline_fallback(data, horizon)
     context = (
         _disable_cmdstanpy_logging()
         if _disable_cmdstanpy_logging is not None
@@ -240,9 +289,18 @@ def prophet_forecast(
             m.fit(df)
             future = m.make_future_dataframe(periods=horizon, freq=freq, include_history=False)
             forecast = m.predict(future)["yhat"].to_numpy()
-        return np.asarray(forecast, dtype=float)
+        out = np.asarray(forecast, dtype=float).ravel()
+        if out.size != horizon:
+            if out.size < horizon:
+                out = np.pad(out, (0, horizon - out.size), mode="edge")
+            out = out[:horizon]
+        if not np.all(np.isfinite(out)):
+            return _baseline_fallback(data, horizon)
+        if np.nanstd(out) < 1e-12 and _tail_diff_std(data) > 1e-12:
+            return _linear_extrapolation(data, horizon)
+        return out.astype(float, copy=False)
     except Exception:
-        return _repeat_last(data, horizon)
+        return _baseline_fallback(data, horizon)
 
 
 __all__ = ["arima_forecast", "ets_forecast", "auto_arima_forecast", "prophet_forecast"]
