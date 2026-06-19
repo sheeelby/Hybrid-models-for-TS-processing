@@ -11,13 +11,29 @@ ensure_src_on_path()
 
 from hybridts.pipelines import evaluate_synth_hybrids  # noqa: E402
 
-DEFAULT_CONFIG = Path("configs/synth_eval.json")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "synth_eval.json"
+
+
+def resolve_config_path(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    if path.exists():
+        return path
+    if not path.is_absolute():
+        alt = PROJECT_ROOT / "configs" / path.name
+        if alt.exists():
+            return alt
+    return path
 
 
 def load_config(path: Path | None):
-    if path is None or not path.exists():
+    resolved = resolve_config_path(path)
+    if resolved is None:
         return {}
-    with open(path) as fh:
+    if not resolved.exists():
+        raise FileNotFoundError(f"Config file not found: {resolved}")
+    with open(resolved) as fh:
         return json.load(fh)
 
 

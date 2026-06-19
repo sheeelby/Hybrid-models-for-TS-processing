@@ -367,6 +367,7 @@ def evaluate_m3_hybrids(
                         )
                         model = VWHybridMixed(
                             aj_model_fn=_base_factory(model_spec.base_model_name, params=aj_params),
+                            neural_component_count=model_spec.neural_component_count,
                             detail_method=str(model_spec.detail_method or "ets"),
                             cfg=cfg,
                             wavelet=wavelet,

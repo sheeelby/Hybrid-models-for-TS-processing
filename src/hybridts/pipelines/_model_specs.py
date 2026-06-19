@@ -10,10 +10,10 @@ LEGACY_LABELS = {
     "nbeats": "N-BEATS Full",
     "raw_timesnet": "TimesNet (raw)",
     "raw_nbeats": "N-BEATS (raw)",
-    "vw_timesnet_ets": "VW + TimesNet + ETS",
-    "vw_timesnet_arima_auto": "VW + TimesNet + Arima_auto",
-    "vw_nbeats_ets": "VW + N-Beats + ETS",
-    "vw_nbeats_arima_auto": "VW + N-Beats + Arima_auto",
+    "vw_timesnet_ets": "MODWT + TimesNet + ETS",
+    "vw_timesnet_arima_auto": "MODWT + TimesNet + Arima_auto",
+    "vw_nbeats_ets": "MODWT + N-Beats + ETS",
+    "vw_nbeats_arima_auto": "MODWT + N-Beats + Arima_auto",
 }
 
 
@@ -25,6 +25,12 @@ class ModelSpec:
     label: str
     decomposition_method: str | None = None
     detail_method: str | None = None
+
+    @property
+    def neural_component_count(self) -> int:
+        if self.kind == "hybrid_mixed" and self.decomposition_method == "stl":
+            return 2
+        return 1
 
 
 def _base_label(name: str) -> str:
@@ -78,7 +84,7 @@ def parse_model_spec(name: str) -> ModelSpec:
                         base_model_name=base,
                         label=LEGACY_LABELS.get(
                             value,
-                            f"VW + {_base_label(base)} + {detail.title()}",
+                            f"MODWT + {_base_label(base)} + {detail.title()}",
                         ),
                         decomposition_method="modwt",
                         detail_method=detail,

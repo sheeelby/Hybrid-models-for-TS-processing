@@ -1,8 +1,8 @@
 {
   "profiles": [
-    "complex_seasonality_examples"
+    "complex_trend_examples"
   ],
-  "n_per_profile": 2,
+  "n_per_profile":3,
   "length": 840,
   "horizon": 24,
   "epochs": 24,
@@ -21,18 +21,23 @@
   "seed": 42,
   "wavelet": "db4",
   "level": 3,
-  "boundary": "wrap",
+  "boundary": "reflect",
   "plot": true,
   "visualize": true,
-  "simulate_full_series": true,
-  "simulation_mode": "rollout",
-  "simulation_train_only_plot": true,
-  "out_prefix": "src/outputs/synth_eval_hybrid_fair_tuned_1",
+  "out_prefix": "src/outputs/synth_eval_complex_trend_modwt_safe",
   "vw_kwargs": {
     "enable_output_blend": true,
     "detail_dampen": true,
-    "detail_anchor": true,
-    "residual_anchor": true
+    "detail_dampen_tau": 2.0,
+    "detail_anchor": false,
+    "residual_anchor": false,
+    "output_blend_min_alpha": 0.2,
+    "output_blend_hard_min_alpha": 0.0,
+    "output_blend_min_improvement": 0.02,
+    "output_blend_emergency_ratio": 1.1,
+    "component_blend_min_weight": 0.35,
+    "component_blend_min_improvement": 0.01,
+    "component_blend_emergency_ratio": 1.1
   },
   "model_params": {
     "timesnet": {
@@ -45,14 +50,14 @@
     "nbeats": {
       "width": 896,
       "depth": 8,
-      "nblocks": 12,
-      "dropout": 0.1,
+      "nblocks": 14,
+      "dropout": 0.08,
       "use_anchor": true,
-      "share_weights": true,
+      "share_weights": false,
       "use_trend": true,
       "use_seasonality": true,
       "use_generic": true,
-      "diff_loss_weight": 0.06
+      "diff_loss_weight": 0.05
     }
   }
 }

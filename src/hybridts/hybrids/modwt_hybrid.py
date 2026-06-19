@@ -116,6 +116,13 @@ class VWDetailPolicy:
     amp_limit: float | None = None
 
 
+@dataclass(frozen=True)
+class VWNeuralPolicy:
+    baseline_kind: str = "last"
+    baseline_period: int | None = None
+    blend_model: float = 1.0
+
+
 def _persistence_forecast(comp: np.ndarray, H: int) -> np.ndarray:
     if H <= 0:
         return np.zeros(0, dtype=float)
@@ -591,7 +598,12 @@ class HybridPlus:
         )
         return component
 
-    def _calibrate_output_blend(self, y: np.ndarray) -> None:
+    def _calibrate_output_blend(
+        self,
+        y: np.ndarray,
+        *,
+        components_override: Sequence[np.ndarray] | None = None,
+    ) -> None:
         y = np.asarray(y, float)
         H = int(self.cfg.horizon)
         self.output_blend_kind = "none"
@@ -606,7 +618,10 @@ class HybridPlus:
             return
 
         try:
-            hyb = np.asarray(self.forecast(y_hist), float)
+            hist_components = None
+            if components_override is not None:
+                hist_components = [np.asarray(comp[: y_hist.size], float) for comp in components_override]
+            hyb = np.asarray(self.forecast(y_hist, components_override=hist_components), float)
         except Exception:
             return
 
@@ -646,7 +661,7 @@ class HybridPlus:
                 for idx, comp in enumerate(comps)
             ]
         if self.enable_output_blend:
-            self._calibrate_output_blend(y)
+            self._calibrate_output_blend(y, components_override=comps)
         else:
             self.output_blend_kind = "none"
             self.output_blend_alpha = 1.0
@@ -780,6 +795,7 @@ class VWHybridMixed:
         self,
         *,
         aj_model_fn,
+        neural_component_count: int = 1,
         detail_method: str,
         cfg: TrainConfig,
         wavelet: str = "db4",
@@ -802,8 +818,10 @@ class VWHybridMixed:
         component_blend_min_weight: float = 0.55,
         component_blend_min_improvement: float = 0.03,
         component_blend_emergency_ratio: float = 1.4,
+        aggregate_low_freq_components: int | None = None,
     ) -> None:
         self.aj_model_fn = aj_model_fn
+        self.neural_component_count = int(max(1, neural_component_count))
         self.detail_method = str(detail_method).lower()
         self.cfg = cfg
         self.wavelet = wavelet
@@ -835,8 +853,14 @@ class VWHybridMixed:
         self.component_blend_min_weight = float(component_blend_min_weight)
         self.component_blend_min_improvement = float(component_blend_min_improvement)
         self.component_blend_emergency_ratio = float(component_blend_emergency_ratio)
+        self.aggregate_low_freq_components = (
+            int(aggregate_low_freq_components) if aggregate_low_freq_components is not None else None
+        )
         self.component_names_: tuple[str, ...] = ()
+        self.neural_component_count_: int = 0
+        self.neural_components: list[HybridComponent] = []
         self.aj_component: HybridComponent | None = None
+        self.neural_policies: list[VWNeuralPolicy] = []
         self.detail_policies: list[VWDetailPolicy] = []
         self.detail_residual_scale: float = 1.0
         self.output_blend_kind: str = "none"
@@ -854,7 +878,37 @@ class VWHybridMixed:
             return ()
         return tuple(["A_J"] + [f"D_{j}" for j in range(1, n_components)])
 
-    def _prepare_component(self, comp: np.ndarray) -> HybridComponent:
+    def _prepare_components_for_modeling(
+        self,
+        comps: Sequence[np.ndarray],
+    ) -> tuple[list[np.ndarray], tuple[str, ...]]:
+        comps_list = [np.asarray(comp, float) for comp in comps]
+        names = self._resolve_component_names(len(comps_list))
+        k_raw = self.aggregate_low_freq_components
+        if k_raw is None or len(comps_list) <= 1:
+            return comps_list, names
+
+        k = int(max(1, min(int(k_raw), len(comps_list))))
+        if k <= 1:
+            return comps_list, names
+
+        low_freq = np.sum(np.stack(comps_list[:k], axis=0), axis=0)
+        agg_name = "LOWFREQ(" + " + ".join(names[:k]) + ")"
+        return [np.asarray(low_freq, float)] + comps_list[k:], (agg_name,) + names[k:]
+
+    def _resolve_neural_component_count(self, n_components: int) -> int:
+        if n_components <= 0:
+            return 0
+        target = int(self.neural_component_count_ or self.neural_component_count)
+        return int(max(1, min(target, n_components)))
+
+    def _prepare_component(
+        self,
+        comp: np.ndarray,
+        *,
+        component_index: int,
+        n_components: int,
+    ) -> HybridComponent:
         Lmax = len(comp) - self.cfg.horizon
         min_windows = 8
         if Lmax <= 0:
@@ -863,8 +917,8 @@ class VWHybridMixed:
             int(self.cfg.lookback),
             horizon=int(self.cfg.horizon),
             Lmax=int(Lmax),
-            component_index=0,
-            n_components=1,
+            component_index=component_index,
+            n_components=n_components,
         )
         ds = WindowDatasetStd(comp, L, self.cfg.horizon, stride=1, scale=True)
         if len(ds) < min_windows:
@@ -885,6 +939,93 @@ class VWHybridMixed:
             emergency_ratio=self.component_blend_emergency_ratio,
         )
         return component
+
+    def _choose_neural_policy(self, component: HybridComponent, comp: np.ndarray, *, component_index: int) -> VWNeuralPolicy:
+        comp = np.asarray(comp, float)
+        default = VWNeuralPolicy(
+            baseline_kind="last",
+            baseline_period=None,
+            blend_model=float(np.clip(component.blend_weight, 0.0, 1.0)),
+        )
+        H = int(self.cfg.horizon)
+        if (
+            component.model is None
+            or component.lookback is None
+            or H <= 0
+            or comp.size < max(component.lookback + H, 2 * H + 8)
+        ):
+            return default
+
+        hist = comp[:-H]
+        tgt = comp[-H:]
+        if hist.size < max(8, component.lookback):
+            return default
+
+        try:
+            pred_model = _neural_component_pred(component, hist, H, self.cfg.device)
+        except Exception:
+            return default
+
+        tau = max(1.5, float(min(H, 8)) / 2.0)
+        w = np.exp(-np.arange(H, dtype=float) / tau)
+        w = w / (np.mean(w) + 1e-12)
+
+        default_pred = _blend_with_persistence(pred_model, hist, H, component.blend_weight)
+        default_score = _weighted_rmse(default_pred, tgt, w)
+        best_policy = default
+        best_score = default_score
+
+        component_name = ""
+        if component_index < len(self.component_names_):
+            component_name = str(self.component_names_[component_index]).strip().lower()
+        allow_seasonal_ets = component_name == "seasonal"
+
+        candidate_specs: list[tuple[str, int | None]] = [("last", None), ("ets", None)]
+        if allow_seasonal_ets:
+            for p in self.seasonal_periods:
+                if hist.size < 2 * int(p):
+                    continue
+                if abs(_acf_lag_score(hist, int(p))) < 0.15:
+                    continue
+                candidate_specs.append(("ets", int(p)))
+
+        for kind, period in candidate_specs:
+            try:
+                base = self._baseline_forecast_raw(hist, H, kind=kind, period=period)
+            except Exception:
+                continue
+            d = pred_model - base
+            n = tgt - base
+            denom = float(np.sum(w * d * d))
+            if denom <= 1e-12:
+                alpha_opt = 0.0 if kind != "last" else float(np.clip(component.blend_weight, 0.0, 1.0))
+            else:
+                alpha_opt = float(np.clip(np.sum(w * d * n) / denom, 0.0, 1.0))
+
+            alpha_candidates = [alpha_opt, 0.0, 0.25, 0.5, 0.75, 1.0]
+            if kind == "last":
+                alpha_candidates.append(float(np.clip(component.blend_weight, 0.0, 1.0)))
+            for alpha in alpha_candidates:
+                pred = float(alpha) * pred_model + (1.0 - float(alpha)) * base
+                score = _weighted_rmse(pred, tgt, w)
+                if score + 1e-12 < best_score:
+                    best_score = score
+                    best_policy = VWNeuralPolicy(
+                        baseline_kind=str(kind),
+                        baseline_period=(int(period) if period else None),
+                        blend_model=float(np.clip(alpha, 0.0, 1.0)),
+                    )
+
+        rel_improvement = float((default_score - best_score) / max(default_score, 1e-12))
+        if rel_improvement < max(0.5 * float(self.component_blend_min_improvement), 0.01):
+            return default
+        return best_policy
+
+    def _fit_neural_policies(self, neural_comps: Sequence[np.ndarray]) -> None:
+        self.neural_policies = [
+            self._choose_neural_policy(component, np.asarray(comp, float), component_index=idx)
+            for idx, (component, comp) in enumerate(zip(self.neural_components, neural_comps))
+        ]
 
     def _detail_candidate_forecast(
         self,
@@ -1035,7 +1176,12 @@ class VWHybridMixed:
     def _baseline_forecast_raw(self, y_hist: np.ndarray, H: int, *, kind: str, period: int | None) -> np.ndarray:
         return _baseline_forecast_raw(y_hist, H, kind=kind, period=period)
 
-    def _calibrate_output_blend(self, y: np.ndarray) -> None:
+    def _calibrate_output_blend(
+        self,
+        y: np.ndarray,
+        *,
+        components_override: Sequence[np.ndarray] | None = None,
+    ) -> None:
         y = np.asarray(y, float)
         H = int(self.cfg.horizon)
         self.output_blend_kind = "none"
@@ -1050,7 +1196,10 @@ class VWHybridMixed:
             return
 
         try:
-            hyb = np.asarray(self.forecast(y_hist), float)
+            hist_components = None
+            if components_override is not None:
+                hist_components = [np.asarray(comp[: y_hist.size], float) for comp in components_override]
+            hyb = np.asarray(self.forecast(y_hist, components_override=hist_components), float)
         except Exception:
             return
 
@@ -1074,26 +1223,65 @@ class VWHybridMixed:
             A, D = modwt_decompose_with_boundary(
                 y, wavelet=self.wavelet, level=self.level, boundary=self.boundary, check=True
             )
+            comps_raw = [A] + D if len(D) else [A]
         else:
-            comps = [np.asarray(c, float) for c in components_override]
-            A = comps[0] if comps else y
-            D = comps[1:] if len(comps) > 1 else []
-        self.component_names_ = self._resolve_component_names(1 + len(D))
-        self._fit_detail_policies(D)
-        self._calibrate_detail_residual_scale(D)
-        self.aj_component = self._prepare_component(A)
+            comps_raw = [np.asarray(c, float) for c in components_override]
+            if not comps_raw:
+                comps_raw = [y]
+        comps, component_names = self._prepare_components_for_modeling(comps_raw)
+        self.component_names_ = tuple(component_names)
+        self.neural_component_count_ = self._resolve_neural_component_count(len(comps))
+        neural_comps = [np.asarray(comp, float) for comp in comps[: self.neural_component_count_]]
+        details = [np.asarray(comp, float) for comp in comps[self.neural_component_count_ :]]
+        self.neural_components = [
+            self._prepare_component(
+                comp,
+                component_index=idx,
+                n_components=len(comps),
+            )
+            for idx, comp in enumerate(neural_comps)
+        ]
+        self.aj_component = self.neural_components[0] if self.neural_components else None
+        self._fit_neural_policies(neural_comps)
+        self._fit_detail_policies(details)
+        self._calibrate_detail_residual_scale(details)
         if self.enable_output_blend:
-            self._calibrate_output_blend(y)
+            self._calibrate_output_blend(y, components_override=comps)
         else:
             self.output_blend_kind = "none"
             self.output_blend_alpha = 1.0
             self.output_blend_period = None
         return self
 
-    def _forecast_neural(self, component: HybridComponent, comp: np.ndarray) -> np.ndarray:
+    def _forecast_neural(
+        self,
+        component: HybridComponent,
+        comp: np.ndarray,
+        *,
+        policy: VWNeuralPolicy | None = None,
+    ) -> np.ndarray:
         H = self.cfg.horizon
-        pred = _neural_component_pred(component, np.asarray(comp, float), H, self.cfg.device)
-        pred = _blend_with_persistence(pred, np.asarray(comp, float), H, component.blend_weight)
+        comp = np.asarray(comp, float)
+        pred_model = _neural_component_pred(component, comp, H, self.cfg.device)
+        pol = policy or VWNeuralPolicy(
+            baseline_kind="last",
+            baseline_period=None,
+            blend_model=float(np.clip(component.blend_weight, 0.0, 1.0)),
+        )
+        if pol.baseline_kind == "last":
+            base = _persistence_forecast(comp, H)
+        else:
+            try:
+                base = self._baseline_forecast_raw(
+                    comp,
+                    H,
+                    kind=pol.baseline_kind,
+                    period=pol.baseline_period,
+                )
+            except Exception:
+                base = _persistence_forecast(comp, H)
+        alpha = float(np.clip(pol.blend_model, 0.0, 1.0))
+        pred = alpha * pred_model + (1.0 - alpha) * np.asarray(base, float)
         return pred.astype(float, copy=False)
 
     def _forecast_detail(self, comp: np.ndarray, *, policy: VWDetailPolicy | None = None) -> np.ndarray:
@@ -1141,17 +1329,29 @@ class VWHybridMixed:
             A, D = modwt_decompose_with_boundary(
                 y, wavelet=self.wavelet, level=self.level, boundary=self.boundary, check=True
             )
+            comps_raw = [A] + D if len(D) else [A]
         else:
-            comps = [np.asarray(c, float) for c in components_override]
-            A = comps[0] if comps else y
-            D = comps[1:] if len(comps) > 1 else []
-        if self.aj_component is None:
+            comps_raw = [np.asarray(c, float) for c in components_override]
+            if not comps_raw:
+                comps_raw = [y]
+        comps, _ = self._prepare_components_for_modeling(comps_raw)
+        if not self.neural_components:
             raise RuntimeError("Call fit() before forecast()")
 
-        aj_pred = self._forecast_neural(self.aj_component, A)
+        neural_count = self._resolve_neural_component_count(len(comps))
+        neural_hist = [np.asarray(comp, float) for comp in comps[:neural_count]]
+        detail_hist = [np.asarray(comp, float) for comp in comps[neural_count:]]
+        neural_preds = [
+            self._forecast_neural(
+                component,
+                comp,
+                policy=(self.neural_policies[idx] if idx < len(self.neural_policies) else None),
+            )
+            for idx, (component, comp) in enumerate(zip(self.neural_components, neural_hist))
+        ]
         detail_preds: List[np.ndarray] = []
         used_policies: List[VWDetailPolicy] = []
-        for idx, dj in enumerate(D):
+        for idx, dj in enumerate(detail_hist):
             policy = self.detail_policies[idx] if idx < len(self.detail_policies) else None
             pred = self._forecast_detail(np.asarray(dj, float), policy=policy)
             if policy is not None:
@@ -1168,8 +1368,9 @@ class VWHybridMixed:
             resid_pred = np.zeros(H, dtype=float)
 
         has_seasonal_detail = any((p.seasonal_period is not None and p.blend_zero > 0.15) for p in used_policies)
-        if self.residual_anchor and (not has_seasonal_detail) and y.size > 0 and A.size > 0 and H > 0:
-            resid_last = float(y[-1] - A[-1])
+        if self.residual_anchor and (not has_seasonal_detail) and y.size > 0 and neural_hist and H > 0:
+            neural_last = float(sum(comp[-1] for comp in neural_hist if comp.size > 0))
+            resid_last = float(y[-1] - neural_last)
             k = int(max(1, min(self.residual_transition_steps, H)))
             if k == 1:
                 resid_pred = resid_pred.astype(float, copy=True)
@@ -1181,7 +1382,11 @@ class VWHybridMixed:
                     alpha = float(alpha0 * (k - 1 - i) / (k - 1))
                     resid_pred[i] = alpha * resid_last + (1.0 - alpha) * resid_pred[i]
 
-        yhat = aj_pred + resid_pred
+        if neural_preds:
+            neural_sum = np.sum(np.stack(neural_preds, 0), axis=0)
+            yhat = neural_sum + resid_pred
+        else:
+            yhat = resid_pred
         if yhat.size > H:
             yhat = yhat[:H]
         if yhat.size < H:
@@ -1213,17 +1418,29 @@ class VWHybridMixed:
             A, D = modwt_decompose_with_boundary(
                 y, wavelet=self.wavelet, level=self.level, boundary=self.boundary, check=True
             )
+            comps_raw = [A] + D if len(D) else [A]
         else:
-            comps = [np.asarray(c, float) for c in components_override]
-            A = comps[0] if comps else y
-            D = comps[1:] if len(comps) > 1 else []
-        if self.aj_component is None:
+            comps_raw = [np.asarray(c, float) for c in components_override]
+            if not comps_raw:
+                comps_raw = [y]
+        comps, _ = self._prepare_components_for_modeling(comps_raw)
+        if not self.neural_components:
             raise RuntimeError("Call fit() before forecast_components()")
 
-        aj_pred = self._forecast_neural(self.aj_component, A)
+        neural_count = self._resolve_neural_component_count(len(comps))
+        neural_hist = [np.asarray(comp, float) for comp in comps[:neural_count]]
+        detail_hist = [np.asarray(comp, float) for comp in comps[neural_count:]]
+        neural_preds = [
+            self._forecast_neural(
+                component,
+                comp,
+                policy=(self.neural_policies[idx] if idx < len(self.neural_policies) else None),
+            )
+            for idx, (component, comp) in enumerate(zip(self.neural_components, neural_hist))
+        ]
         detail_preds: List[np.ndarray] = []
         used_policies: List[VWDetailPolicy] = []
-        for idx, dj in enumerate(D):
+        for idx, dj in enumerate(detail_hist):
             policy = self.detail_policies[idx] if idx < len(self.detail_policies) else None
             pred = self._forecast_detail(np.asarray(dj, float), policy=policy)
             if policy is not None:
@@ -1240,8 +1457,9 @@ class VWHybridMixed:
             resid_pred = np.zeros(H, dtype=float)
 
         has_seasonal_detail = any((p.seasonal_period is not None and p.blend_zero > 0.15) for p in used_policies)
-        if self.residual_anchor and (not has_seasonal_detail) and y.size > 0 and A.size > 0 and H > 0:
-            resid_last = float(y[-1] - A[-1])
+        if self.residual_anchor and (not has_seasonal_detail) and y.size > 0 and neural_hist and H > 0:
+            neural_last = float(sum(comp[-1] for comp in neural_hist if comp.size > 0))
+            resid_last = float(y[-1] - neural_last)
             k = int(max(1, min(self.residual_transition_steps, H)))
             if k == 1:
                 resid_pred[0] = 0.6 * resid_last + 0.4 * float(resid_pred[0])
@@ -1266,9 +1484,14 @@ class VWHybridMixed:
         else:
             details = []
 
-        names = self.component_names_ or self._resolve_component_names(1 + len(details))
-        out: dict[str, np.ndarray] = {names[0]: np.asarray(aj_pred, float)}
-        for name, pred in zip(names[1:], details):
+        total_components = len(neural_preds) + len(details)
+        names = self.component_names_ or self._resolve_component_names(total_components)
+        if len(names) < total_components:
+            names = self._resolve_component_names(total_components)
+        out: dict[str, np.ndarray] = {}
+        for name, pred in zip(names[: len(neural_preds)], neural_preds):
+            out[name] = np.asarray(pred, float)
+        for name, pred in zip(names[len(neural_preds) : len(neural_preds) + len(details)], details):
             out[name] = np.asarray(pred, float)
         return out
 

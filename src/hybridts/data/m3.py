@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Tuple
 import numpy as np
 import pandas as pd
 
+from .._plotting import place_legend_below
 from ..config.settings import settings
 
 M3_H: Dict[str, int] = {"yearly": 6, "quarterly": 8, "monthly": 18}
@@ -232,8 +233,7 @@ def plot_forecast(title: str, y_tr: np.ndarray, y_te: np.ndarray, forecasts: Dic
     pad = 0.06 * (ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     ax.set_ylim(ymin - pad, ymax + pad)
 
-    ax.legend(fontsize=8, ncol=2, frameon=False)
-    fig.tight_layout()
+    place_legend_below(fig, ax, fontsize=8, frameon=False, ncol=2, top=1.0)
     if save_path:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -276,8 +276,7 @@ def plot_forecast_test_only(
     pad = 0.06 * (ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     ax.set_ylim(ymin - pad, ymax + pad)
 
-    ax.legend(fontsize=8, ncol=2, frameon=False)
-    fig.tight_layout()
+    place_legend_below(fig, ax, fontsize=8, frameon=False, ncol=2, top=1.0)
     if save_path:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)

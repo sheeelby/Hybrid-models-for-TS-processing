@@ -1,33 +1,33 @@
 {
-  "profiles": [
-    "complex_seasonality_examples"
-  ],
-  "n_per_profile": 2,
-  "length": 840,
-  "horizon": 24,
+  "categories": ["quarterly"],
+  "n_per_cat": 20,
+  "pick": "random",
+  "seed": 42,
   "epochs": 24,
   "base_models": [
-    "timesnet",
-    "nbeats",
-    "vw_timesnet_arima_auto",
-    "vw_nbeats_arima_auto",
     "vw_timesnet_ets",
+    "vw_timesnet_arima_auto",
     "vw_nbeats_ets",
-    "stl_timesnet_arima_auto",
-    "stl_nbeats_arima_auto",
+    "vw_nbeats_arima_auto",
     "stl_timesnet_ets",
-    "stl_nbeats_ets"
+    "stl_timesnet_arima_auto",
+    "stl_nbeats_ets",
+    "stl_nbeats_arima_auto"
   ],
-  "seed": 42,
   "wavelet": "db4",
   "level": 3,
-  "boundary": "wrap",
-  "plot": true,
-  "visualize": true,
-  "simulate_full_series": true,
+  "boundary": "reflect",
+  "stl_kwargs": {
+    "robust": true
+  },
+  "plot_test_only": true,
+  "simulate_full_series": false,
   "simulation_mode": "rollout",
   "simulation_train_only_plot": true,
-  "out_prefix": "src/outputs/synth_eval_hybrid_fair_tuned_1",
+  "force_rebuild_csv": false,
+  "force_rebuild_global_components": false,
+  "visualize": true,
+  "out_prefix": "src/outputs/m4_eval_modwt_vs_stl_fair",
   "vw_kwargs": {
     "enable_output_blend": true,
     "detail_dampen": true,

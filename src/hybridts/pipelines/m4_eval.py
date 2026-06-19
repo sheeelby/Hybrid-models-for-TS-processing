@@ -42,6 +42,11 @@ from ..viz import (
 
 from ._csv_checkpoints import append_row, reset_csv
 from ._model_specs import parse_model_spec
+from ._simulation import (
+    clamp_simulation_mixed_alpha,
+    normalize_simulation_mode,
+    simulation_context_window,
+)
 
 
 def _fitted_one_step_series(
@@ -51,6 +56,7 @@ def _fitted_one_step_series(
     device: str,
     total_len: int | None = None,
     mode: str = "rollout",
+    mixed_alpha: float = 0.5,
 ) -> np.ndarray:
     comp_tr = np.asarray(comp_tr, float).ravel()
     n = int(comp_tr.size)
@@ -88,15 +94,17 @@ def _fitted_one_step_series(
         init_len = min(lookback, total_len)
     model = component.model
     model.eval()
-    mode = str(mode or "rollout").lower()
+    mode = normalize_simulation_mode(mode)
+    mixed_alpha = clamp_simulation_mixed_alpha(mixed_alpha)
     for t in range(init_len, total_len):
-        if mode == "fitted" and t < n:
-            window = comp_tr[max(0, t - lookback) : t]
-            if window.size < lookback:
-                pad = np.repeat(window[0] if window.size else out[0], lookback - window.size)
-                window = np.concatenate([pad, window])
-        else:
-            window = out[t - lookback : t]
+        window = simulation_context_window(
+            comp_tr,
+            out,
+            t,
+            lookback,
+            mode=mode,
+            mixed_alpha=mixed_alpha,
+        )
         xb = ((window - mu) / sd).astype(np.float32).reshape(1, 1, -1)
         with torch.no_grad():
             pred = model(torch.from_numpy(xb).to(device)).detach().cpu().numpy().ravel()
@@ -114,6 +122,7 @@ def _fitted_one_step_series_direct(
     device: str,
     total_len: int | None = None,
     mode: str = "rollout",
+    mixed_alpha: float = 0.5,
 ) -> np.ndarray:
     y_tr = np.asarray(y_tr, float).ravel()
     n = int(y_tr.size)
@@ -148,15 +157,17 @@ def _fitted_one_step_series_direct(
         init_len = min(lookback, total_len)
 
     model.eval()
-    mode = str(mode or "rollout").lower()
+    mode = normalize_simulation_mode(mode)
+    mixed_alpha = clamp_simulation_mixed_alpha(mixed_alpha)
     for t in range(init_len, total_len):
-        if mode == "fitted" and t < n:
-            window = y_tr[max(0, t - lookback) : t]
-            if window.size < lookback:
-                pad = np.repeat(window[0] if window.size else out[0], lookback - window.size)
-                window = np.concatenate([pad, window])
-        else:
-            window = out[t - lookback : t]
+        window = simulation_context_window(
+            y_tr,
+            out,
+            t,
+            lookback,
+            mode=mode,
+            mixed_alpha=mixed_alpha,
+        )
         xb = ((window - mu) / sd).astype(np.float32).reshape(1, 1, -1)
         with torch.no_grad():
             pred = model(torch.from_numpy(xb).to(device)).detach().cpu().numpy().ravel()
@@ -178,6 +189,33 @@ def _base_factory(name: str, params: Mapping[str, Any] | None = None):
         return make_model(name, cfg, params=params)
 
     return _fn
+
+
+def _merge_method_kwargs(
+    shared: Mapping[str, Any] | None,
+    *,
+    by_method: Mapping[str, Mapping[str, Any]] | None,
+    method: str | None,
+) -> dict[str, Any]:
+    out = dict(shared or {})
+    method_key = str(method or "").strip().lower()
+    if by_method and method_key:
+        scoped = by_method.get(method_key)
+        if scoped:
+            out.update(dict(scoped))
+    return out
+
+
+def _resolve_vw_kwargs(
+    shared: Mapping[str, Any] | None,
+    *,
+    by_method: Mapping[str, Mapping[str, Any]] | None,
+    method: str | None,
+    default_neural_component_count: int,
+) -> tuple[int, dict[str, Any]]:
+    out = _merge_method_kwargs(shared, by_method=by_method, method=method)
+    neural_component_count = int(out.pop("neural_component_count", default_neural_component_count))
+    return neural_component_count, out
 
 
 def _effective_model_params(
@@ -202,6 +240,27 @@ def _effective_model_params(
     return params
 
 
+def _build_train_config(
+    *,
+    lookback: int,
+    horizon: int,
+    epochs: int,
+    train_kwargs: Mapping[str, Any] | None = None,
+) -> TrainConfig:
+    cfg_kwargs: dict[str, Any] = {
+        "lookback": int(lookback),
+        "horizon": int(horizon),
+        "epochs": int(epochs),
+        "batch_size": 64,
+        "lr": 3e-4,
+        "weight_decay": 2e-4,
+        "clip": 0.5,
+    }
+    if train_kwargs:
+        cfg_kwargs.update(dict(train_kwargs))
+    return TrainConfig(**cfg_kwargs)
+
+
 def _cat_level(cat: str, base_level: int) -> int:
     base_level = int(base_level)
     suggested = {
@@ -213,6 +272,123 @@ def _cat_level(cat: str, base_level: int) -> int:
         "hourly": max(base_level, 5),
     }
     return int(suggested.get(str(cat).lower(), base_level))
+
+
+_CLASSICAL_LABELS = ("ARIMA", "ARIMA_auto", "ETS", "Prophet")
+
+
+def _model_family_labels(hybrid_models: Sequence[Any]) -> dict[str, list[str]]:
+    families = {
+        "modwt": [],
+        "stl": [],
+        "raw": [],
+        "classical": list(_CLASSICAL_LABELS),
+    }
+    for spec in hybrid_models:
+        if spec.kind == "raw":
+            families["raw"].append(spec.label)
+        elif str(spec.decomposition_method or "modwt").lower() == "stl":
+            families["stl"].append(spec.label)
+        else:
+            families["modwt"].append(spec.label)
+    return families
+
+
+def _best_family_score(
+    mean_row: pd.Series,
+    *,
+    labels: Sequence[str],
+    metric: str,
+) -> tuple[str | None, float]:
+    best_label: str | None = None
+    best_score = np.nan
+    for label in labels:
+        col = f"{label.replace(' ', '_')}_{metric}"
+        if col not in mean_row.index:
+            continue
+        value = mean_row[col]
+        if pd.isna(value):
+            continue
+        score = float(value)
+        if best_label is None or score < best_score:
+            best_label = str(label)
+            best_score = score
+    return best_label, float(best_score) if best_label is not None else np.nan
+
+
+def _build_family_comparison_df(
+    df: pd.DataFrame,
+    *,
+    hybrid_models: Sequence[Any],
+    metric_names: Sequence[str],
+) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    families = _model_family_labels(hybrid_models)
+    all_labels: list[str] = []
+    for family_labels in families.values():
+        all_labels.extend(list(family_labels))
+
+    scopes: list[tuple[str, pd.DataFrame]] = [
+        (str(category), cat_df)
+        for category, cat_df in df.groupby("category", sort=True)
+    ]
+    scopes.append(("overall", df))
+
+    rows: list[dict[str, Any]] = []
+    for scope, scope_df in scopes:
+        mean_row = scope_df.mean(numeric_only=True)
+        base_rec = {
+            "scope": scope,
+            "n_series": int(len(scope_df)),
+        }
+        for metric in metric_names:
+            rec = dict(base_rec)
+            rec["metric"] = metric
+            for family in ("modwt", "stl", "raw", "classical"):
+                best_model, best_score = _best_family_score(
+                    mean_row,
+                    labels=families.get(family, ()),
+                    metric=metric,
+                )
+                rec[f"{family}_best_model"] = best_model or ""
+                rec[f"{family}_score"] = best_score
+            best_overall_model, best_overall_score = _best_family_score(
+                mean_row,
+                labels=all_labels,
+                metric=metric,
+            )
+            rec["best_overall_model"] = best_overall_model or ""
+            rec["best_overall_score"] = best_overall_score
+
+            modwt_score = float(rec.get("modwt_score", np.nan))
+            stl_score = float(rec.get("stl_score", np.nan))
+            classical_score = float(rec.get("classical_score", np.nan))
+            raw_score = float(rec.get("raw_score", np.nan))
+
+            rec["modwt_minus_stl"] = (
+                float(modwt_score - stl_score)
+                if np.isfinite(modwt_score) and np.isfinite(stl_score)
+                else np.nan
+            )
+            rec["modwt_minus_classical"] = (
+                float(modwt_score - classical_score)
+                if np.isfinite(modwt_score) and np.isfinite(classical_score)
+                else np.nan
+            )
+            rec["stl_minus_classical"] = (
+                float(stl_score - classical_score)
+                if np.isfinite(stl_score) and np.isfinite(classical_score)
+                else np.nan
+            )
+            rec["raw_minus_classical"] = (
+                float(raw_score - classical_score)
+                if np.isfinite(raw_score) and np.isfinite(classical_score)
+                else np.nan
+            )
+            rows.append(rec)
+    return pd.DataFrame(rows)
 
 
 def evaluate_m4_hybrids(
@@ -234,13 +410,20 @@ def evaluate_m4_hybrids(
     series_override: Mapping[str, Sequence[str]] | None = None,
     visualize: bool = False,
     plot_test_only: bool = True,
-    use_full_modwt_components: bool = True,
     simulate_full_series: bool = False,
     simulation_mode: str = "rollout",
+    simulation_mixed_alpha: float = 0.5,
     simulation_train_only_plot: bool = False,
     model_params: Mapping[str, Mapping[str, Any]] | None = None,
+    train_kwargs: Mapping[str, Any] | None = None,
+    hybrid_kwargs: Mapping[str, Any] | None = None,
+    vw_kwargs: Mapping[str, Any] | None = None,
+    hybrid_kwargs_by_method: Mapping[str, Mapping[str, Any]] | None = None,
+    vw_kwargs_by_method: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> pd.DataFrame:
     hybrid_models = tuple(parse_model_spec(m) for m in (base_models or ("timesnet", "nbeats")))
+    hybrid_kwargs_eff = dict(hybrid_kwargs) if hybrid_kwargs else {}
+    vw_kwargs_eff = dict(vw_kwargs) if vw_kwargs else {}
 
     csv_dir = Path(csv_dir or settings.m4_csv_dir)
     out_dir = Path(out_prefix or (settings.outputs_dir / "m4_eval"))
@@ -308,160 +491,147 @@ def evaluate_m4_hybrids(
             selected_list = [pairs[int(i)] for i in idx]
 
         # Global hybrid components for neural base models (TimesNet / N-BEATS).
-        # For M4 we optionally use MODWT components computed on the full series
-        # (train+test) to avoid boundary mismatch; in that mode, global pretraining
-        # is disabled to keep training consistent.
         global_hybrid_components: Dict[str, List[HybridComponent]] = {}
-        if not use_full_modwt_components:
-            per_eff = per if per and per > 1 else None
-            for model_spec in hybrid_models:
-                if model_spec.kind != "hybrid_all":
-                    continue
-                decomp_spec = DecompositionSpec(
-                    method=model_spec.decomposition_method or "modwt",
-                    wavelet=wavelet,
-                    level=cat_level,
-                    boundary=boundary,
-                    seasonal_period=per_eff,
-                    stl_kwargs=stl_kwargs,
-                )
-                params = _effective_model_params(
-                    model_spec.name,
-                    base_model_name=model_spec.base_model_name,
-                    seasonal_period=per_eff,
-                    model_params=model_params,
-                )
-                hybrid_ckpt = out_dir / f"{cat}_{model_spec.name}_hybrid_global.pt"
-                if hybrid_ckpt.exists() and not force_rebuild_global_components:
-                    try:
-                        ckpt = torch.load(hybrid_ckpt, map_location="cpu")
-                        if "horizon" in ckpt and int(ckpt.get("horizon", -1)) != int(H):
-                            raise ValueError("checkpoint params mismatch")
-                        if str(ckpt.get("decomposition_method", "modwt")).lower() != decomp_spec.method:
-                            raise ValueError("checkpoint params mismatch")
-                        if decomp_spec.method == "modwt":
-                            if "wavelet" in ckpt and ckpt.get("wavelet") != wavelet:
-                                raise ValueError("checkpoint params mismatch")
-                            if "level" in ckpt and int(ckpt.get("level", -1)) != int(cat_level):
-                                raise ValueError("checkpoint params mismatch")
-                            if "boundary" in ckpt and str(ckpt.get("boundary", "wrap")).lower() != str(boundary).lower():
-                                raise ValueError("checkpoint params mismatch")
-                        else:
-                            if "seasonal_period" in ckpt and ckpt.get("seasonal_period") != per_eff:
-                                raise ValueError("checkpoint params mismatch")
-                            if "stl_kwargs" in ckpt and dict(ckpt.get("stl_kwargs", {})) != dict(stl_kwargs or {}):
-                                raise ValueError("checkpoint params mismatch")
-                        comps_meta = list(ckpt.get("components", []))
-                        if any(("per_series_scaling" not in item) for item in comps_meta):
-                            raise ValueError("checkpoint too old (missing per_series_scaling)")
-                        if any(not bool(item.get("per_series_scaling", False)) for item in comps_meta):
-                            raise ValueError("checkpoint too old (global scaling)")
-                        comps: List[HybridComponent] = []
-                        for item in ckpt.get("components", []):
-                            state_dict = item.get("state_dict")
-                            lookback = item.get("lookback")
-                            mu = float(item.get("mu", 0.0))
-                            sd = float(item.get("sd", 1.0))
-                            model = None
-                            if state_dict is not None and lookback is not None:
-                                cfg_global = TrainConfig(
-                                    lookback=int(lookback),
-                                    horizon=H,
-                                    epochs=0,
-                                    batch_size=128,
-                                    lr=1e-3,
-                                    weight_decay=1e-4,
-                                    clip=1.0,
-                                )
-                                model = _base_factory(model_spec.base_model_name, params=params)(cfg_global)
-                                model.load_state_dict(state_dict)
-                                model.to(cfg_global.device)
-                                model.eval()
-                            comps.append(
-                                HybridComponent(
-                                    model=model,
-                                    mu=mu,
-                                    sd=sd,
-                                    lookback=lookback,
-                                    per_series_scaling=bool(item.get("per_series_scaling", True)),
-                                )
-                            )
-                        if comps:
-                            global_hybrid_components[model_spec.name] = comps
-                            continue
-                    except Exception as exc:
-                        print(f"[m4:{cat}] failed to load hybrid components for {model_spec.name}: {exc}")
-
-                hybrid_cfg = TrainConfig(
-                    lookback=max(16, min(256, max(32, 2 * H, 3 * per))),
-                    horizon=H,
-                    epochs=max(int(epochs), 2),
-                    batch_size=128,
-                    lr=3e-4,
-                    weight_decay=1e-4,
-                    clip=1.0,
-                )
-                comps = build_global_hybrid_components(
-                    selected_list,
-                    hybrid_cfg,
-                    base_model_fn=_base_factory(model_spec.base_model_name, params=params),
-                    wavelet=wavelet,
-                    level=cat_level,
-                    boundary=boundary,
-                    decompose_fn=lambda y_arr, spec=decomp_spec: decompose_series(y_arr, spec=spec, check=True).components,
-                )
-                global_hybrid_components[model_spec.name] = comps
+        per_eff = per if per and per > 1 else None
+        for model_spec in hybrid_models:
+            if model_spec.kind != "hybrid_all":
+                continue
+            decomp_spec = DecompositionSpec(
+                method=model_spec.decomposition_method or "modwt",
+                wavelet=wavelet,
+                level=cat_level,
+                boundary=boundary,
+                seasonal_period=per_eff,
+                stl_kwargs=stl_kwargs,
+            )
+            params = _effective_model_params(
+                model_spec.name,
+                base_model_name=model_spec.base_model_name,
+                seasonal_period=per_eff,
+                model_params=model_params,
+            )
+            hybrid_ckpt = out_dir / f"{cat}_{model_spec.name}_hybrid_global.pt"
+            if hybrid_ckpt.exists() and not force_rebuild_global_components:
                 try:
-                    payload = {
-                        "category": cat,
-                        "model_name": model_spec.name,
-                        "horizon": H,
-                        "decomposition_method": decomp_spec.method,
-                        "wavelet": wavelet,
-                        "level": cat_level,
-                        "boundary": boundary,
-                        "seasonal_period": per_eff,
-                        "stl_kwargs": dict(stl_kwargs or {}),
-                        "components": [],
-                    }
-                    for comp in comps:
-                        state = comp.model.state_dict() if comp.model is not None else None
-                        payload["components"].append(
-                            {
-                                "state_dict": state,
-                                "mu": comp.mu,
-                                "sd": comp.sd,
-                                "lookback": comp.lookback,
-                                "per_series_scaling": bool(getattr(comp, "per_series_scaling", False)),
-                            }
+                    ckpt = torch.load(hybrid_ckpt, map_location="cpu")
+                    if "horizon" in ckpt and int(ckpt.get("horizon", -1)) != int(H):
+                        raise ValueError("checkpoint params mismatch")
+                    if str(ckpt.get("decomposition_method", "modwt")).lower() != decomp_spec.method:
+                        raise ValueError("checkpoint params mismatch")
+                    if decomp_spec.method == "modwt":
+                        if "wavelet" in ckpt and ckpt.get("wavelet") != wavelet:
+                            raise ValueError("checkpoint params mismatch")
+                        if "level" in ckpt and int(ckpt.get("level", -1)) != int(cat_level):
+                            raise ValueError("checkpoint params mismatch")
+                        if "boundary" in ckpt and str(ckpt.get("boundary", "wrap")).lower() != str(boundary).lower():
+                            raise ValueError("checkpoint params mismatch")
+                    else:
+                        if "seasonal_period" in ckpt and ckpt.get("seasonal_period") != per_eff:
+                            raise ValueError("checkpoint params mismatch")
+                        if "stl_kwargs" in ckpt and dict(ckpt.get("stl_kwargs", {})) != dict(stl_kwargs or {}):
+                            raise ValueError("checkpoint params mismatch")
+                    comps_meta = list(ckpt.get("components", []))
+                    if any(("per_series_scaling" not in item) for item in comps_meta):
+                        raise ValueError("checkpoint too old (missing per_series_scaling)")
+                    if any(not bool(item.get("per_series_scaling", False)) for item in comps_meta):
+                        raise ValueError("checkpoint too old (global scaling)")
+                    comps: List[HybridComponent] = []
+                    for item in ckpt.get("components", []):
+                        state_dict = item.get("state_dict")
+                        lookback = item.get("lookback")
+                        mu = float(item.get("mu", 0.0))
+                        sd = float(item.get("sd", 1.0))
+                        model = None
+                        if state_dict is not None and lookback is not None:
+                            cfg_global = TrainConfig(
+                                lookback=int(lookback),
+                                horizon=H,
+                                epochs=0,
+                                batch_size=128,
+                                lr=1e-3,
+                                weight_decay=1e-4,
+                                clip=1.0,
+                            )
+                            model = _base_factory(model_spec.base_model_name, params=params)(cfg_global)
+                            model.load_state_dict(state_dict)
+                            model.to(cfg_global.device)
+                            model.eval()
+                        comps.append(
+                            HybridComponent(
+                                model=model,
+                                mu=mu,
+                                sd=sd,
+                                lookback=lookback,
+                                per_series_scaling=bool(item.get("per_series_scaling", True)),
+                            )
                         )
-                    torch.save(payload, hybrid_ckpt)
+                    if comps:
+                        global_hybrid_components[model_spec.name] = comps
+                        continue
                 except Exception as exc:
-                    print(f"[m4:{cat}] failed to save hybrid components for {model_spec.name}: {exc}")
+                    print(f"[m4:{cat}] failed to load hybrid components for {model_spec.name}: {exc}")
+
+            hybrid_cfg = TrainConfig(
+                lookback=max(16, min(256, max(32, 2 * H, 3 * per))),
+                horizon=H,
+                epochs=max(int(epochs), 2),
+                batch_size=128,
+                lr=3e-4,
+                weight_decay=1e-4,
+                clip=1.0,
+            )
+            comps = build_global_hybrid_components(
+                selected_list,
+                hybrid_cfg,
+                base_model_fn=_base_factory(model_spec.base_model_name, params=params),
+                wavelet=wavelet,
+                level=cat_level,
+                boundary=boundary,
+                decompose_fn=lambda y_arr, spec=decomp_spec: decompose_series(y_arr, spec=spec, check=True).components,
+            )
+            global_hybrid_components[model_spec.name] = comps
+            try:
+                payload = {
+                    "category": cat,
+                    "model_name": model_spec.name,
+                    "horizon": H,
+                    "decomposition_method": decomp_spec.method,
+                    "wavelet": wavelet,
+                    "level": cat_level,
+                    "boundary": boundary,
+                    "seasonal_period": per_eff,
+                    "stl_kwargs": dict(stl_kwargs or {}),
+                    "components": [],
+                }
+                for comp in comps:
+                    state = comp.model.state_dict() if comp.model is not None else None
+                    payload["components"].append(
+                        {
+                            "state_dict": state,
+                            "mu": comp.mu,
+                            "sd": comp.sd,
+                            "lookback": comp.lookback,
+                            "per_series_scaling": bool(getattr(comp, "per_series_scaling", False)),
+                        }
+                    )
+                torch.save(payload, hybrid_ckpt)
+            except Exception as exc:
+                print(f"[m4:{cat}] failed to save hybrid components for {model_spec.name}: {exc}")
 
         cat_rows: List[Dict] = []
         for sid, y_tr, y_te in _progress(selected_list, desc=f"{cat} series", leave=False):
             L = best_L(y_tr, H, per)
-            y_full = (
-                np.concatenate([np.asarray(y_tr, float), np.asarray(y_te, float)], axis=0)
-                if use_full_modwt_components
-                else None
-            )
             total_len = int(len(y_tr) + H)
-            cfg = TrainConfig(
+            cfg = _build_train_config(
                 lookback=L,
                 horizon=H,
                 epochs=epochs,
-                batch_size=64,
-                lr=3e-4,
-                weight_decay=2e-4,
-                clip=0.5,
+                train_kwargs=train_kwargs,
             )
             forecasts: Dict[str, np.ndarray] = {}
             decomposition_specs_for_viz: Dict[str, DecompositionSpec] = {}
             component_forecasts_by_group: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
             train_decomp_cache: dict[tuple[Any, ...], Any] = {}
-            full_decomp_cache: dict[tuple[Any, ...], Any] = {}
             simulations: Dict[str, np.ndarray] = {}
             for model_spec in hybrid_models:
                 label = model_spec.label
@@ -481,16 +651,11 @@ def evaluate_m4_hybrids(
                             seasonal_period=per_eff,
                             stl_kwargs=stl_kwargs,
                         )
-                        cache = full_decomp_cache if use_full_modwt_components else train_decomp_cache
                         key = decomp_spec.cache_key()
-                        if key not in cache:
-                            source = y_full if use_full_modwt_components and y_full is not None else y_tr
-                            cache[key] = decompose_series(source, spec=decomp_spec, check=True)
-                        dec_result = cache[key]
-                        train_components = tuple(
-                            np.asarray(comp[: len(y_tr)] if use_full_modwt_components else comp, float)
-                            for comp in dec_result.components
-                        )
+                        if key not in train_decomp_cache:
+                            train_decomp_cache[key] = decompose_series(y_tr, spec=decomp_spec, check=True)
+                        dec_result = train_decomp_cache[key]
+                        train_components = tuple(np.asarray(comp, float) for comp in dec_result.components)
                         comps_override = [np.asarray(comp, float) for comp in train_components]
                         component_names = tuple(dec_result.names)
                         decomposition_specs_for_viz[decomp_spec.group_key] = decomp_spec
@@ -508,9 +673,14 @@ def evaluate_m4_hybrids(
                             wavelet=wavelet,
                             level=cat_level,
                             boundary=boundary,
-                            pretrained_components=None if use_full_modwt_components else global_hybrid_components.get(model_spec.name),
+                            pretrained_components=global_hybrid_components.get(model_spec.name),
                             seasonal_period=per_eff,
                             component_names=component_names,
+                            **_merge_method_kwargs(
+                                hybrid_kwargs_eff,
+                                by_method=hybrid_kwargs_by_method,
+                                method=model_spec.decomposition_method,
+                            ),
                         ).fit(y_tr, components_override=comps_override)
                         forecasts[label] = model.forecast(y_tr, components_override=comps_override)
                         component_map = model.forecast_components(y_tr, components_override=comps_override)
@@ -525,6 +695,7 @@ def evaluate_m4_hybrids(
                                         device=cfg.device,
                                         total_len=total_len,
                                         mode=simulation_mode,
+                                        mixed_alpha=simulation_mixed_alpha,
                                     )
                                 )
                             y_sim = np.sum(np.stack(fitted_components, 0), axis=0)
@@ -549,6 +720,7 @@ def evaluate_m4_hybrids(
                                 device=cfg.device,
                                 total_len=total_len,
                                 mode=simulation_mode,
+                                mixed_alpha=simulation_mixed_alpha,
                             )
                     elif model_spec.kind == "hybrid_mixed":
                         aj_params = _effective_model_params(
@@ -557,15 +729,24 @@ def evaluate_m4_hybrids(
                             seasonal_period=per_eff,
                             model_params=model_params,
                         )
+                        neural_component_count, vw_kwargs_local = _resolve_vw_kwargs(
+                            vw_kwargs_eff,
+                            by_method=vw_kwargs_by_method,
+                            method=model_spec.decomposition_method,
+                            default_neural_component_count=model_spec.neural_component_count,
+                        )
                         model = VWHybridMixed(
                             aj_model_fn=_base_factory(model_spec.base_model_name, params=aj_params),
+                            neural_component_count=neural_component_count,
                             detail_method=str(model_spec.detail_method or "ets"),
                             cfg=cfg,
                             wavelet=wavelet,
                             level=cat_level,
                             boundary=boundary,
                             seasonal_period=per_eff,
+                            seasonal_periods=((per_eff,) if per_eff else None),
                             component_names=component_names,
+                            **vw_kwargs_local,
                         ).fit(y_tr, components_override=comps_override)
                         forecasts[label] = model.forecast(y_tr, components_override=comps_override)
                         component_map = model.forecast_components(y_tr, components_override=comps_override)
@@ -574,18 +755,21 @@ def evaluate_m4_hybrids(
                             simulate_full_series
                             and train_components is not None
                             and component_names is not None
-                            and model.aj_component is not None
+                            and model.neural_components
                         ):
-                            A_tr_arr = np.asarray(train_components[0], float)
-                            Aj_sim = _fitted_one_step_series(
-                                model.aj_component,
-                                A_tr_arr,
-                                device=cfg.device,
-                                total_len=total_len,
-                                mode=simulation_mode,
-                            )
+                            neural_count = min(len(model.neural_components), len(train_components))
+                            neural_sum = np.zeros(total_len, dtype=float)
+                            for comp_obj, comp_tr_arr in zip(model.neural_components, train_components[:neural_count]):
+                                neural_sum += _fitted_one_step_series(
+                                    comp_obj,
+                                    np.asarray(comp_tr_arr, float),
+                                    device=cfg.device,
+                                    total_len=total_len,
+                                    mode=simulation_mode,
+                                    mixed_alpha=simulation_mixed_alpha,
+                                )
                             details_sum = np.zeros(total_len, dtype=float)
-                            for name, dj_tr in zip(component_names[1:], train_components[1:]):
+                            for name, dj_tr in zip(component_names[neural_count:], train_components[neural_count:]):
                                 dj_tr = np.asarray(dj_tr, float)
                                 dj_pred = np.asarray((component_map or {}).get(name, np.zeros(H)), float).ravel()
                                 if dj_pred.size != H:
@@ -594,7 +778,7 @@ def evaluate_m4_hybrids(
                                 if dj_series.size < total_len:
                                     dj_series = np.pad(dj_series, (0, total_len - dj_series.size), mode="edge")
                                 details_sum += dj_series[:total_len]
-                            simulations[label] = (Aj_sim + details_sum)[:total_len]
+                            simulations[label] = (neural_sum + details_sum)[:total_len]
                     else:
                         raise ValueError(f"Unknown hybrid model '{model_spec.name}'")
                 except Exception as exc:
@@ -749,6 +933,33 @@ def evaluate_m4_hybrids(
         overall = df[cols].mean(numeric_only=True)
         print(f"[{metric} overall]")
         print(overall.round(3))
+
+    family_summary_df = _build_family_comparison_df(
+        df,
+        hybrid_models=hybrid_models,
+        metric_names=metric_names,
+    )
+    if not family_summary_df.empty:
+        family_summary_csv = out_dir / "decomposition_summary.csv"
+        family_summary_df.to_csv(family_summary_csv, index=False)
+        print(f"[saved] decomposition summary: {family_summary_csv}")
+        family_smape_df = family_summary_df[family_summary_df["metric"] == "sMAPE"].copy()
+        if not family_smape_df.empty:
+            compare_cols = [
+                "scope",
+                "modwt_best_model",
+                "modwt_score",
+                "stl_best_model",
+                "stl_score",
+                "classical_best_model",
+                "classical_score",
+                "modwt_minus_stl",
+                "modwt_minus_classical",
+                "stl_minus_classical",
+            ]
+            existing_cols = [col for col in compare_cols if col in family_smape_df.columns]
+            print("[sMAPE family comparison]")
+            print(family_smape_df[existing_cols].round(3))
     return df
 
 

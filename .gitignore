@@ -4,7 +4,8 @@ __pycache__/
 .env
 .venv/
 src/hybridts.egg-info
-.pdf
-.docx
+*.pdf
+*.docx
 *.csv
 *.png
+*.pt

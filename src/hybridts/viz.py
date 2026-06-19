@@ -6,6 +6,8 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 
+from ._plotting import place_legend_below
+
 
 def _clean_series(y: Iterable[float]) -> np.ndarray:
     data = np.asarray(list(y), dtype=float)
@@ -20,6 +22,54 @@ def _clean_series(y: Iterable[float]) -> np.ndarray:
 def _ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _aggregate_reference_component(
+    name: str,
+    *,
+    base_components: Mapping[str, np.ndarray],
+) -> np.ndarray | None:
+    if name in base_components:
+        return np.asarray(base_components[name], float)
+    if not (name.startswith("LOWFREQ(") and name.endswith(")")):
+        return None
+
+    inner = name[len("LOWFREQ(") : -1]
+    parts = [part.strip() for part in inner.split("+") if part.strip()]
+    if not parts or any(part not in base_components for part in parts):
+        return None
+    return np.sum(
+        np.stack([np.asarray(base_components[part], float) for part in parts], axis=0),
+        axis=0,
+    ).astype(float, copy=False)
+
+
+def _resolve_reference_components_for_plot(
+    *,
+    component_forecasts: Mapping[str, Mapping[str, np.ndarray]],
+    reference_names: Iterable[str],
+    reference_components: Iterable[np.ndarray],
+) -> list[tuple[str, np.ndarray]]:
+    base_items = [(str(name), np.asarray(comp, float)) for name, comp in zip(reference_names, reference_components)]
+    base_map = {name: comp for name, comp in base_items}
+
+    ordered_target_names: list[str] = []
+    for comp_map in component_forecasts.values():
+        for name in comp_map.keys():
+            key = str(name)
+            if key not in ordered_target_names:
+                ordered_target_names.append(key)
+
+    if not ordered_target_names:
+        return base_items
+
+    resolved: list[tuple[str, np.ndarray]] = []
+    for name in ordered_target_names:
+        comp = _aggregate_reference_component(name, base_components=base_map)
+        if comp is None:
+            return base_items
+        resolved.append((name, comp))
+    return resolved
 
 
 def save_raw_series_plot(
@@ -46,8 +96,7 @@ def save_raw_series_plot(
     ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.25)
     ax.minorticks_on()
     ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.18)
-    ax.legend(fontsize=8, frameon=False, ncol=2)
-    fig.tight_layout()
+    place_legend_below(fig, ax, fontsize=8, frameon=False, ncol=2, top=1.0)
 
     save_path = Path(save_path)
     _ensure_dir(save_path.parent)
@@ -233,8 +282,7 @@ def save_forecast_zoom_plot(
     ymax = float(np.nanmax([np.nanmax(s) for s in all_series if s.size > 0]))
     pad = 0.06 * (ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     ax.set_ylim(ymin - pad, ymax + pad)
-    ax.legend(fontsize=8, ncol=2, frameon=False)
-    fig.tight_layout()
+    place_legend_below(fig, ax, fontsize=8, frameon=False, ncol=2, top=1.0)
 
     save_path = Path(save_path)
     _ensure_dir(save_path.parent)
@@ -277,8 +325,7 @@ def save_forecast_test_only_plot(
     pad = 0.06 * (ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     ax.set_ylim(ymin - pad, ymax + pad)
 
-    ax.legend(fontsize=8, ncol=2, frameon=False)
-    fig.tight_layout()
+    place_legend_below(fig, ax, fontsize=8, frameon=False, ncol=2, top=1.0)
 
     save_path = Path(save_path)
     _ensure_dir(save_path.parent)
@@ -328,8 +375,7 @@ def save_simulation_full_plot(
     pad = 0.06 * (ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     ax.set_ylim(ymin - pad, ymax + pad)
 
-    ax.legend(fontsize=8, ncol=2, frameon=False)
-    fig.tight_layout()
+    place_legend_below(fig, ax, fontsize=8, frameon=False, ncol=2, top=1.0)
     save_path = Path(save_path)
     _ensure_dir(save_path.parent)
     fig.savefig(save_path, bbox_inches="tight", dpi=160)
@@ -372,8 +418,7 @@ def save_simulation_train_plot(
     pad = 0.06 * (ymax - ymin) if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0
     ax.set_ylim(ymin - pad, ymax + pad)
 
-    ax.legend(fontsize=8, ncol=2, frameon=False)
-    fig.tight_layout()
+    place_legend_below(fig, ax, fontsize=8, frameon=False, ncol=2, top=1.0)
     save_path = Path(save_path)
     _ensure_dir(save_path.parent)
     fig.savefig(save_path, bbox_inches="tight", dpi=160)
@@ -397,6 +442,7 @@ def save_series_viz_bundle(
     acf_lags: int = 48,
     zoom_tail: int = 120,
     component_forecasts_by_group: Optional[Dict[str, Dict[str, Dict[str, np.ndarray]]]] = None,
+    component_reference_labels: Mapping[str, str] | None = None,
 ) -> None:
     """Save per-series plots into named subfolders under out_dir.
 
@@ -483,11 +529,15 @@ def save_series_viz_bundle(
                 continue
             spec = spec_obj if isinstance(spec_obj, DecompositionSpec) else DecompositionSpec(**dict(spec_obj))
             suffix = f"_{group_key}" if multiple_groups else ""
+            reference_label = "test"
+            if component_reference_labels is not None:
+                reference_label = str(component_reference_labels.get(group_key, reference_label) or "test")
             save_component_forecast_plot(
                 y_tr=np.asarray(y_tr, float),
                 y_te=np.asarray(y_te, float),
                 component_forecasts=component_forecasts,
                 decomposition_spec=spec,
+                component_reference_label=reference_label,
                 title=f"{title_prefix} component forecasts",
                 save_path=out_dir / f"06_component_forecasts{suffix}" / f"{series_key}.png",
             )
@@ -496,6 +546,7 @@ def save_series_viz_bundle(
                 y_te=np.asarray(y_te, float),
                 component_forecasts=component_forecasts,
                 decomposition_spec=spec,
+                component_reference_label=reference_label,
                 title=f"{title_prefix} component forecasts (test only)",
                 save_path=out_dir / f"08_component_forecasts_test_only{suffix}" / f"{series_key}.png",
             )
@@ -507,6 +558,7 @@ def save_component_forecast_plot(
     y_te: np.ndarray,
     component_forecasts: Dict[str, Dict[str, np.ndarray]],
     decomposition_spec=None,
+    component_reference_label: str = "test",
     decomposition_method: str = "modwt",
     wavelet: str = "db4",
     level: int = 1,
@@ -540,7 +592,12 @@ def save_component_forecast_plot(
 
     y_full = np.concatenate([y_tr, y_te]).astype(float, copy=False)
     result = decompose_series(y_full, spec=spec, check=True)
-    comps = list(zip(result.names, result.components))
+    comps = _resolve_reference_components_for_plot(
+        component_forecasts=component_forecasts,
+        reference_names=result.names,
+        reference_components=result.components,
+    )
+    reference_label = str(component_reference_label or "test")
 
     n = len(comps)
     fig, axes = plt.subplots(n, 1, figsize=(10.5, 2.2 * n), sharex=True)
@@ -555,7 +612,7 @@ def save_component_forecast_plot(
         xs_te = np.arange(y_tr.size, y_tr.size + H)
 
         ax.plot(xs_tr, tr, linewidth=1.6, color="C0", label="train" if idx == 0 else None)
-        ax.plot(xs_te, te, linewidth=1.8, color="C3", label="test" if idx == 0 else None)
+        ax.plot(xs_te, te, linewidth=1.8, color="C3", label=reference_label if idx == 0 else None)
         for model_label, comp_map in component_forecasts.items():
             pred = comp_map.get(cname)
             if pred is None:
@@ -581,9 +638,7 @@ def save_component_forecast_plot(
 
     axes[-1].set_xlabel("t")
     fig.suptitle(title, fontsize=10)
-    # Put legend on the first subplot to avoid repetition.
-    axes[0].legend(fontsize=8, ncol=2, frameon=False)
-    fig.tight_layout()
+    place_legend_below(fig, axes, fontsize=8, frameon=False, ncol=2)
 
     save_path = Path(save_path)
     _ensure_dir(save_path.parent)
@@ -597,6 +652,7 @@ def save_component_forecast_test_only_plot(
     y_te: np.ndarray,
     component_forecasts: Dict[str, Dict[str, np.ndarray]],
     decomposition_spec=None,
+    component_reference_label: str = "test",
     decomposition_method: str = "modwt",
     wavelet: str = "db4",
     level: int = 1,
@@ -630,7 +686,12 @@ def save_component_forecast_test_only_plot(
 
     y_full = np.concatenate([y_tr, y_te]).astype(float, copy=False)
     result = decompose_series(y_full, spec=spec, check=True)
-    comps = list(zip(result.names, result.components))
+    comps = _resolve_reference_components_for_plot(
+        component_forecasts=component_forecasts,
+        reference_names=result.names,
+        reference_components=result.components,
+    )
+    reference_label = str(component_reference_label or "test")
 
     n = len(comps)
     fig, axes = plt.subplots(n, 1, figsize=(10.5, 2.2 * n), sharex=True)
@@ -640,7 +701,7 @@ def save_component_forecast_test_only_plot(
     xs = np.arange(H)
     for idx, (ax, (cname, full)) in enumerate(zip(axes, comps)):
         te = full[y_tr.size :]
-        ax.plot(xs, te, linewidth=1.8, color="C3", label="test" if idx == 0 else None)
+        ax.plot(xs, te, linewidth=1.8, color="C3", label=reference_label if idx == 0 else None)
         for model_label, comp_map in component_forecasts.items():
             pred = comp_map.get(cname)
             if pred is None:
@@ -657,8 +718,7 @@ def save_component_forecast_test_only_plot(
 
     axes[-1].set_xlabel("t (test)")
     fig.suptitle(title, fontsize=10)
-    axes[0].legend(fontsize=8, ncol=2, frameon=False)
-    fig.tight_layout()
+    place_legend_below(fig, axes, fontsize=8, frameon=False, ncol=2)
 
     save_path = Path(save_path)
     _ensure_dir(save_path.parent)

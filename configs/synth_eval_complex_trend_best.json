@@ -1,20 +1,22 @@
 {
   "profiles": [
-    "nonseasonal_sample",
-    "seasonal_sample",
-    "complex_seasonality_examples"
+    "complex_trend_examples"
   ],
-  "n_per_profile": 6,
+  "n_per_profile": 2,
   "length": 840,
   "horizon": 24,
-  "epochs": 12,
+  "epochs": 24,
   "base_models": [
-    "timesnet",
+   "timesnet",
     "nbeats",
     "vw_timesnet_arima_auto",
     "vw_nbeats_arima_auto",
     "vw_timesnet_ets",
-    "vw_nbeats_ets"
+    "vw_nbeats_ets",
+    "stl_timesnet_arima_auto",
+    "stl_nbeats_arima_auto",
+    "stl_timesnet_ets",
+    "stl_nbeats_ets"
   ],
   "seed": 42,
   "wavelet": "db4",
@@ -22,10 +24,13 @@
   "boundary": "wrap",
   "plot": false,
   "visualize": false,
-  "out_prefix": "src/outputs/synth_eval_hybrid_win_oracle",
-  "hybrid_oracle_mode": "perfect",
-  "hybrid_oracle_metric": "RMSE",
-  "hybrid_oracle_scope": "all",
+  "out_prefix": "src/outputs/synth_eval_complex_trend_best",
+  "vw_kwargs": {
+    "enable_output_blend": true,
+    "detail_dampen": true,
+    "detail_anchor": true,
+    "residual_anchor": true
+  },
   "model_params": {
     "timesnet": {
       "d_model": 160,
